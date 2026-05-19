@@ -16,23 +16,23 @@ that generates a full set of CSV files and documentation when run. No data is ge
 inside the chat. The script is the only deliverable shown in conversation.
 
 The datasets produced are built for product demos, proof-of-concept evaluations, client
-workshops, tool showcases, and hackathons. They are deliberately realistic — not toy data.
+workshops, tool showcases, and hackathons. They are deliberately realistic - not toy data.
 
 ### What Makes This Different From Generic Sample Data
 
 | Capability | Description |
 |---|---|
-| Company research | If you name a real company, Claude researches its business model and geography, then models the dataset after it — without using the company name anywhere |
+| Company research | If you name a real company, Claude researches its business model and geography, then models the dataset after it - without using the company name anywhere |
 | Dynamic tables | No fixed table set is always generated. Every table is justified by the use case and end-user persona |
 | Global geography specificity | No broad regional label (APAC, Europe, MENA, LATAM) is ever a leaf node. Every region is decomposed into sub-regions, countries, and cities with authentic local names |
-| Country-level name pools | Customer and employee names are drawn from country-specific pools matching local ethnicity and naming conventions — across 30+ countries |
+| Country-level name pools | Customer and employee names are drawn from country-specific pools matching local ethnicity and naming conventions - across 30+ countries |
 | Product size weightage | Demand distributions differ by product category and region. A medium T-shirt outsells an XXL in the US; XS outsells L in East Asia |
 | Regional product affinity | Products are weighted by regional preference. Junk food sells more in North America; instant noodles sell more in SE Asia; alcohol is zero in Middle East |
 | Zero reconciliation | Every connected value pair (order header vs lines, inventory in vs out, gross vs net pay, returns vs sales) reconciles to zero |
 | Macro event engine | Real-world disruptions (supply chain crisis, inflation surge, COVID impact) are applied as time-bounded multipliers across geographies and categories |
 | Seasonal accuracy | Seasonality is hemisphere-aware. Australian summer is December, not June. Diwali affects South Asia and its diaspora. Ramadan follows the lunar calendar |
 | Discount rotation | Max 15-25% of SKUs are discounted in any week. Discounts rotate by category and align with seasonal events |
-| Dataset size tiers | Small (20K-100K rows), Medium (100K-500K), Large (500K-2M) — selected at intake |
+| Dataset size tiers | Small (20K-100K rows), Medium (100K-500K), Large (500K-2M) - selected at intake |
 
 ---
 
@@ -70,10 +70,10 @@ Claude will activate this skill when it detects any of the following:
 
 Before generating anything, Claude asks four questions in a single grouped message:
 
-1. **Use case** — What story does the data need to tell? (Sales performance, HR analytics, supply chain, marketing ROI, etc.)
-2. **Sub-industry** — Which specific vertical? (Grocery retail vs warehouse club vs fashion vs electronics, etc.)
-3. **Dataset size** — Small (S), Medium (M), or Large (L)?
-4. **Audience** — Who will be in the room? (CFO, Sales Director, Operations Manager, BI Developer, etc.)
+1. **Use case** - What story does the data need to tell? (Sales performance, HR analytics, supply chain, marketing ROI, etc.)
+2. **Sub-industry** - Which specific vertical? (Grocery retail vs warehouse club vs fashion vs electronics, etc.)
+3. **Dataset size** - Small (S), Medium (M), or Large (L)?
+4. **Audience** - Who will be in the room? (CFO, Sales Director, Operations Manager, BI Developer, etc.)
 
 If you name a real company and provide a detailed description, Claude extracts most of this
 from your input and only asks for what is genuinely missing.
@@ -81,7 +81,7 @@ from your input and only asks for what is genuinely missing.
 ### Example Prompt
 
 ```
-Create a dataset for a retail business like Costco — warehouse concept across NA,
+Create a dataset for a retail business like Costco - warehouse concept across NA,
 Australia, and Asia. Products should vary by region. Include online sales with logistics,
 carrier tracking, returns and refunds, and a membership programme with Gold, Executive,
 and Business tiers. Also include warehouse employees by department, IT hubs as a separate
@@ -97,7 +97,7 @@ discount rotation calendar, embed macro events, and output a complete Python scr
 
 After answering the intake questions, Claude produces:
 
-- **`generate_[industry]_dataset.py`** — the complete Python script, shown as a
+- **`generate_[industry]_dataset.py`** - the complete Python script, shown as a
   downloadable artifact in chat. Run it with `python generate_[industry]_dataset.py`.
 
 The script itself generates (in an `output_[industry]_[date]/` folder):
@@ -157,7 +157,7 @@ REGIONAL_PRODUCT_AFFINITY = {
     ("Junk Food / Snacks", "North America"): 1.8,   # high demand
     ("Junk Food / Snacks", "East Asia"):     0.7,   # below baseline
     ("Alcohol", "Middle East"):              0.0,   # not sold
-    ("Instant Noodles", "SE Asia — Maritime"): 1.8,
+    ("Instant Noodles", "SE Asia - Maritime"): 1.8,
     # ... per category x region
 }
 ```
@@ -178,15 +178,15 @@ Every connected value pair is derived, not independently generated:
 | File | Description |
 |---|---|
 | `generate_[industry]_dataset.py` | The Python script (shown in chat) |
-| `DimDate.csv` | Date dimension — always present |
-| `DimGeography.csv` | Geography hierarchy — always present |
-| `DimProduct.csv` | Product dimension — present when use case involves products |
-| `DimCustomer.csv` | Customer dimension — present when use case involves customers |
-| `FactSalesTransaction.csv` | Sales fact — present for sales/revenue use cases |
-| `FactOrder.csv` / `FactOrderLine.csv` | Order header and lines — present for fulfilment use cases |
-| `FactInventorySnapshot.csv` | Inventory flow — present for operations/supply chain use cases |
-| `FactPayroll.csv` | Payroll — present for HR use cases |
-| `FactReturn.csv` | Returns and refunds — present when sales or fulfilment tables are included |
+| `DimDate.csv` | Date dimension - always present |
+| `DimGeography.csv` | Geography hierarchy - always present |
+| `DimProduct.csv` | Product dimension - present when use case involves products |
+| `DimCustomer.csv` | Customer dimension - present when use case involves customers |
+| `FactSalesTransaction.csv` | Sales fact - present for sales/revenue use cases |
+| `FactOrder.csv` / `FactOrderLine.csv` | Order header and lines - present for fulfilment use cases |
+| `FactInventorySnapshot.csv` | Inventory flow - present for operations/supply chain use cases |
+| `FactPayroll.csv` | Payroll - present for HR use cases |
+| `FactReturn.csv` | Returns and refunds -   present when sales or fulfilment tables are included |
 | `[industry]_dataset_guide_public.md` | Audience-facing documentation |
 | `[industry]_dataset_guide_internal.md` | Builder/developer documentation |
 
@@ -208,7 +208,7 @@ The script runs the following checks before printing the final summary:
 | Geography specificity | No broad regional label used as a leaf node in DimGeography |
 | Anonymisation | Real company name does not appear in any output file |
 
-Failures appear as warnings in the summary — they do not stop the script.
+Failures appear as warnings in the summary - they do not stop the script.
 
 ---
 
@@ -287,7 +287,7 @@ attribution block automatically.
 
 | Version | Date | Changes |
 |---|---|---|
-| 1.0 | May 2026 | Initial release — global geography, size weights, regional affinity, zero reconciliation, company research, dynamic table selection |
+| 1.0 | May 2026 | Initial release - global geography, size weights, regional affinity, zero reconciliation, company research, dynamic table selection |
 
 ---
 
