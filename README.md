@@ -103,8 +103,8 @@ After answering the intake questions, Claude produces:
 The script itself generates (in an `output_[industry]_[date]/` folder):
 
 - All dimension and fact CSV files (DimDate, DimGeography, DimProduct, FactSalesTransaction, etc.)
-- `[industry]_dataset_guide_public.md` — audience-facing documentation (KPIs, table inventory, relationship overview)
-- `[industry]_dataset_guide_internal.md` — builder documentation (schema details, macro events applied, reconciliation rules, generation parameters)
+- `[industry]_dataset_guide_public.md` - audience-facing documentation (KPIs, table inventory, relationship overview)
+- `[industry]_dataset_guide_internal.md` - builder documentation (schema details, macro events applied, reconciliation rules, generation parameters)
 
 ### Script Requirements
 
