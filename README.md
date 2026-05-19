@@ -279,7 +279,6 @@ attribution block automatically.
 
 | Skill | Description |
 |---|---|
-| `enterprise-planning-dataset-creator` | Full enterprise-scale datasets with mandatory P&L reconciliation, financial account hierarchies, and multi-scenario planning data. Use when you need production-scale financial data, not demo data. |
 | `enterprise-pbix-model-builder` | Builds a fully modelled Power BI semantic model from an enterprise dataset. Produces BIM, DAX measures, and documentation. Can be chained after enterprise-planning-dataset-creator. |
 
 ---
