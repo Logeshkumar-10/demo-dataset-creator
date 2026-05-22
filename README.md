@@ -7,8 +7,8 @@
 [![Built for Claude](https://img.shields.io/badge/Built%20for-Claude%20AI-orange.svg)](https://claude.ai)
 [![Maintainer](https://img.shields.io/badge/Maintainer-Logeshkumar%20Sivakumar-green.svg)](https://www.linkedin.com/in/logeshkumar-sivakumar/)
 
-**Designed and Developed by Logeshkumar Sivakumar**
-**Contact: elogu2001@outlook.com**
+**Designed and Developed by Logeshkumar Sivakumar** | 
+**Contact: elogu2001@outlook.com** | 
 **© 2026 Logeshkumar Sivakumar. All rights reserved.**
 
 ---
