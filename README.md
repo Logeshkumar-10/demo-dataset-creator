@@ -281,7 +281,7 @@ attribution block automatically.
 
 | Skill | Description |
 |---|---|
-| `enterprise-pbix-model-builder` | Builds a fully modelled Power BI semantic model from an enterprise dataset. Produces BIM, DAX measures, and documentation. Can be chained after enterprise-planning-dataset-creator. |
+| [`enterprise-pbix-model-builder`](https://github.com/Logeshkumar-10/pbix-model-creator) | Builds a fully modelled Power BI semantic model from an enterprise dataset. Produces BIM, DAX measures, and documentation. Can be chained after enterprise-planning-dataset-creator. |
 
 ---
 
