@@ -93,7 +93,7 @@ The user controls size and scope — the skill controls quality.
 
 ## Company Research Rule — Triggers When a Real Company Is Named
 
-If the user mentions any real company name (e.g., Costco, IKEA, Zara, Grab, Flipkart,
+If the user mentions any real company name (e.g., Walmart, IKEA, Zara, Grab, Flipkart,
 Toyota, Marriott, DoorDash, HDFC Bank, Telstra), this rule activates immediately.
 
 ### Step 1 — Research Before Anything Else
@@ -174,7 +174,7 @@ Do NOT include this section in the public documentation.
 **Never design or generate anything until all four intake questions are answered.**
 
 **Exception — Company Named + Rich Description Provided**: If the user names a real company
-AND provides a detailed use case description (like the Costco example), treat this as a
+AND provides a detailed use case description (like the Walmart example), treat this as a
 near-complete intake. Do NOT repeat questions that the description already answers. Only
 ask for dataset size and end-user persona if those are genuinely missing. Extract everything
 else from the description and company research.
@@ -201,7 +201,7 @@ KPIs the audience will interrogate. Always ask:
 > — Logistics and delivery tracking
 > — [Other — please describe]"
 
-If the user provides a rich description (like the Costco example), treat it as the use
+If the user provides a rich description (like the Walmart example), treat it as the use
 case and do NOT ask again. Extract the use case from the description.
 
 **Question 2 — Sub-Industry**
@@ -1074,6 +1074,225 @@ fact_return = (
     )
 )
 # Result: Every return references a real sales line. ✅
+
+# Pattern 5 — Budget vs Actual variance realism (V3 corrected logic)
+#
+# ROOT CAUSE OF V2 BUG:
+#   V2 set Budget = Actual * (1 + bias), then derived Actual from Budget.
+#   This inverted the direction: an account marked "favourable" was actually
+#   showing adverse variance because Budget ended up HIGHER than Actual for
+#   income lines, and LOWER than Actual for cost lines — exactly backwards.
+#
+# V3 FIX — Budget is always derived FROM Actual, not the other way around:
+#   Budget = Actual / (1 + bias)
+#
+#   For an income account with positive bias:
+#     bias = +0.05 → Budget = Actual / 1.05 → Budget < Actual → favourable ✅
+#
+#   For a cost account with negative bias (underspend):
+#     bias = -0.04 → Budget = Actual / 0.96 → Budget > Actual → favourable ✅
+#
+# SEMANTIC RULES (document in every generated script):
+#   Income accounts  : positive bias  = favourable variance (Actual beats Budget)
+#   Cost accounts    : negative bias  = favourable variance (Actual underspends Budget)
+#   Profit lines     : NEVER generated independently — always derived as Revenue − Costs
+#
+# VARIANCE_PROFILE structure:
+#   account_type: {
+#       "b_bias"  : baseline budget bias (mean)
+#       "b_noise" : noise band around budget bias (±half-range)
+#       "f_bias"  : baseline forecast bias (mean)
+#       "f_noise" : noise band around forecast bias
+#       "shock_multiplier": how much to widen noise during macro shock periods
+#   }
+#
+# Bias sign convention:
+#   Positive = Actual expected to EXCEED Budget (good for Income, bad for Costs)
+#   Negative = Actual expected to FALL SHORT of Budget (bad for Income, good for Costs)
+
+VARIANCE_PROFILE = {
+    "Revenue": {
+        "b_bias": 0.04, "b_noise": 0.03,   # Budget set ~4% below Actual on average
+        "f_bias": 0.02, "f_noise": 0.02,   # Forecast tighter — closer to Actual
+        "shock_multiplier": 2.0,            # Revenue swings harder in macro shocks
+    },
+    "Non-recurring Revenue": {
+        "b_bias": 0.08, "b_noise": 0.06,   # Harder to budget — wider spread
+        "f_bias": 0.04, "f_noise": 0.04,
+        "shock_multiplier": 2.5,
+    },
+    "COGS": {
+        "b_bias": -0.03, "b_noise": 0.025, # Budget set slightly above Actual (underspend target)
+        "f_bias": -0.01, "f_noise": 0.015,
+        "shock_multiplier": 2.0,            # Supply chain shocks hit COGS hard
+    },
+    "Operating Expense": {
+        "b_bias": -0.04, "b_noise": 0.03,
+        "f_bias": -0.02, "f_noise": 0.02,
+        "shock_multiplier": 1.5,
+    },
+    "Payroll": {
+        "b_bias": -0.02, "b_noise": 0.015, # Payroll is tightly controlled
+        "f_bias": -0.01, "f_noise": 0.01,
+        "shock_multiplier": 1.2,
+    },
+    "CapEx": {
+        "b_bias": -0.06, "b_noise": 0.05,  # Projects typically run over budget
+        "f_bias": -0.03, "f_noise": 0.04,
+        "shock_multiplier": 1.8,
+    },
+    "Tax": {
+        "b_bias": -0.01, "b_noise": 0.01,  # Tax is near-deterministic
+        "f_bias": -0.005, "f_noise": 0.008,
+        "shock_multiplier": 1.1,
+    },
+    "Other Income": {
+        "b_bias": 0.03, "b_noise": 0.04,
+        "f_bias": 0.01, "f_noise": 0.02,
+        "shock_multiplier": 1.5,
+    },
+    "Financial Expense": {
+        "b_bias": -0.02, "b_noise": 0.02,
+        "f_bias": -0.01, "f_noise": 0.015,
+        "shock_multiplier": 1.3,
+    },
+}
+
+def get_variance(actual_amount, account_type, scenario, is_shock_period=False,
+                 rng=None):
+    """
+    V3 corrected variance function.
+
+    Derives Budget or Forecast FROM Actual using:
+        ScenarioAmount = Actual / (1 + bias + noise)
+
+    This guarantees the sign of variance is always correct:
+        Income  + positive bias → Budget < Actual → favourable variance
+        Costs   + negative bias → Budget > Actual → favourable variance (underspend)
+
+    Parameters
+    ----------
+    actual_amount : float   The Actual value for this account and period
+    account_type  : str     Key into VARIANCE_PROFILE
+    scenario      : str     "Budget" or "Forecast"
+    is_shock_period: bool   Widens noise band if True
+    rng           : np.random.Generator or None
+
+    Returns
+    -------
+    float   The derived Budget or Forecast amount (rounded to 2 dp)
+    """
+    if rng is None:
+        rng = np.random.default_rng()
+
+    profile = VARIANCE_PROFILE.get(account_type, {
+        "b_bias": 0.0, "b_noise": 0.03,
+        "f_bias": 0.0, "f_noise": 0.02,
+        "shock_multiplier": 1.5,
+    })
+
+    shock_mult = profile["shock_multiplier"] if is_shock_period else 1.0
+
+    if scenario == "Budget":
+        b_bias  = profile["b_bias"]
+        b_noise = profile["b_noise"] * shock_mult
+        noise_b = rng.uniform(-b_noise, b_noise)
+        divisor = 1.0 + b_bias + noise_b
+        # Guard against division by near-zero
+        divisor = max(divisor, 0.50) if divisor > 0 else min(divisor, -0.50)
+        return round(actual_amount / divisor, 2)
+
+    elif scenario == "Forecast":
+        f_bias  = profile["f_bias"]
+        f_noise = profile["f_noise"] * shock_mult
+        noise_f = rng.uniform(-f_noise, f_noise)
+        divisor = 1.0 + f_bias + noise_f
+        divisor = max(divisor, 0.50) if divisor > 0 else min(divisor, -0.50)
+        return round(actual_amount / divisor, 2)
+
+    else:
+        raise ValueError(f"scenario must be 'Budget' or 'Forecast', got: {scenario!r}")
+
+
+# Apply across FactFinancial — generate Actual first, derive Budget and Forecast from it:
+def build_fact_financial(dim_account, dim_date, shock_date_ranges, rng=None):
+    """
+    Correct generation order for financial facts:
+      1. Generate ActualAmount (driven by macro events + seasonality)
+      2. Derive BudgetAmount  = get_variance(actual, account_type, "Budget")
+      3. Derive ForecastAmount= get_variance(actual, account_type, "Forecast")
+      4. Compute VarianceAmount  = ActualAmount - BudgetAmount
+      5. Compute VariancePct     = VarianceAmount / |BudgetAmount|
+
+    NEVER generate BudgetAmount first and derive Actual from it — that was the V2 bug.
+    """
+    if rng is None:
+        rng = np.random.default_rng(42)
+
+    def is_shock(d):
+        return any(s <= d <= e for s, e in shock_date_ranges)
+
+    rows = []
+    for _, acct in dim_account.iterrows():
+        for _, dt in dim_date[dim_date["DayNum"] == 1].iterrows():  # monthly grain
+            actual = generate_actual_for_period(acct, dt)           # macro + seasonal
+            shock  = is_shock(dt["Date"])
+            budget = get_variance(actual, acct["AccountType"], "Budget",
+                                  is_shock_period=shock, rng=rng)
+            fcast  = get_variance(actual, acct["AccountType"], "Forecast",
+                                  is_shock_period=shock, rng=rng)
+            rows.append({
+                "AccountKey":       acct["AccountKey"],
+                "DateKey":          dt["DateKey"],
+                "ActualAmount":     round(actual, 2),
+                "BudgetAmount":     budget,
+                "ForecastAmount":   fcast,
+                "VarianceAmount":   round(actual - budget, 2),
+                "VariancePct":      round((actual - budget) / abs(budget), 4)
+                                    if budget != 0 else 0.0,
+                "ForecastVariance": round(actual - fcast, 2),
+            })
+    return pd.DataFrame(rows)
+
+
+# Validation — assert mix is present and direction is semantically correct:
+def validate_variance_mix(fact_financial, dim_account, min_adverse_pct=0.20):
+    """
+    Assert:
+      1. At least min_adverse_pct of rows have adverse variance
+         (negative for Income, positive for Cost accounts)
+      2. The MIX flag ensures no all-one-direction result
+    """
+    if "VarianceAmount" not in fact_financial.columns:
+        print("ℹ️  VARIANCE MIX: VarianceAmount column not found — skipping")
+        return
+
+    merged = fact_financial.merge(
+        dim_account[["AccountKey", "AccountType"]], on="AccountKey", how="left"
+    )
+
+    # Income accounts: favourable = positive VarianceAmount
+    # Cost accounts:   favourable = negative VarianceAmount
+    income_types = {"Revenue", "Non-recurring Revenue", "Other Income"}
+
+    def is_adverse(row):
+        if row["AccountType"] in income_types:
+            return row["VarianceAmount"] < 0   # Actual below budget = adverse for income
+        else:
+            return row["VarianceAmount"] > 0   # Actual above budget = adverse for costs
+
+    merged["IsAdverse"] = merged.apply(is_adverse, axis=1)
+    total      = len(merged)
+    adverse_n  = merged["IsAdverse"].sum()
+    adverse_pct = adverse_n / total if total > 0 else 0
+
+    if adverse_pct < min_adverse_pct:
+        print(f"⚠️  VARIANCE MIX: Only {adverse_pct:.1%} of rows show semantically adverse variance "
+              f"(minimum expected {min_adverse_pct:.0%}). Check VARIANCE_PROFILE biases.")
+    else:
+        print(f"✅ Variance mix passed — {1-adverse_pct:.1%} favourable / "
+              f"{adverse_pct:.1%} adverse across {total:,} rows "
+              f"(Income: positive bias, Costs: negative bias)")
 ```
 
 #### Reconciliation Validation — Run Before Export
@@ -1091,6 +1310,25 @@ def validate_header_line_reconciliation(fact_order, fact_order_line, tolerance=0
         print(failures[["OrderKey", "OrderAmount", "LineTotal", "Variance"]].head(10))
     else:
         print(f"✅ Header/line reconciliation passed — {len(merged):,} orders reconcile")
+
+def validate_variance_mix(fact_financial, min_negative_pct=0.20):
+    """
+    Assert at least 20% of budget vs actual rows have negative variance.
+    A dataset where ALL variances are positive (or all negative) is unrealistic.
+    Real P&L always has a mix of over- and under-performing lines.
+    """
+    if "VarianceAmount" not in fact_financial.columns:
+        print("ℹ️  VARIANCE MIX: VarianceAmount column not found — skipping")
+        return
+    total   = len(fact_financial)
+    neg_pct = (fact_financial["VarianceAmount"] < 0).sum() / total if total > 0 else 0
+    if neg_pct < min_negative_pct:
+        print(f"⚠️  VARIANCE MIX: Only {neg_pct:.1%} of rows have negative variance "
+              f"(minimum expected {min_negative_pct:.0%}). "
+              f"All actuals skewing same direction — check VARIANCE_PROFILE settings.")
+    else:
+        print(f"✅ Variance mix passed — {1-neg_pct:.1%} favourable / "
+              f"{neg_pct:.1%} unfavourable across {total:,} rows")
 
 def validate_inventory_flow(fact_inventory):
     """Assert Closing = Opening + In - Out for every snapshot row."""
@@ -1212,7 +1450,10 @@ Use case involves marketing?
 
 Use case involves financial P&L / budget?
   → YES → Generate: DimAccount, FactFinancial (or FactGLEntry), FactPlan
-           Apply: Actual vs Plan variance; no standalone account hierarchy without financials
+           Apply: Actual vs Plan variance with MIXED directions — revenue lines
+                  60-70% favourable, cost lines 55-65% unfavourable; widen bands
+                  during macro shock periods. Use VARIANCE_PROFILE + generate_actual_amount().
+                  No standalone account hierarchy without financials.
   → NO  → Skip DimAccount entirely (follow Accounts Table Rule)
 
 Use case involves membership / loyalty?
@@ -1609,6 +1850,7 @@ Required sections:
   ✅ Discount calendar          : [count] discount windows, max [n]% SKUs/week
   ✅ Product size weights       : Applied to [list of categories]
   ✅ Regional product affinity  : [count] category × region overrides applied
+  ✅ Budget/actual variance mix : [xx]% favourable / [xx]% unfavourable (mixed direction enforced)
   ✅ Geography specificity      : No broad regional labels as leaf nodes ([count] sub-regions)
   ✅ Ethnicity-matched names    : [list of country-level name pools used]
   ✅ FK integrity               : All foreign keys validated
@@ -1621,6 +1863,8 @@ Required sections:
   Inventory Flow                ✅                  [n] snapshots reconcile
   Payroll Gross/Net             ✅                  [n] rows reconcile
   Returns vs Sales              ✅                  [n] returns reference real lines
+  Variance Mix (Budget/Actual)  ✅                  [xx]% favourable / [xx]% adverse (semantic check)
+  DimAccount Sort Keys          ✅                  [n] accounts, HierarchySortKey unique
   [any additional pairs]        ✅ / ⚠️             ...
   ─────────────────────────────────────────────────────────
   ⚠️ RECONCILIATION WARNINGS: [n] — see details above   (only shown if warnings exist)
@@ -1765,10 +2009,175 @@ def validate_anonymisation(output_dir, real_company_name):
 #     return f"{first} {last}", gender
 ```
 
+### DimAccount with Sort Keys
+
+Every DimAccount must include sort key columns so Power BI can order the P&L correctly
+in matrix visuals, tables, and drill-downs without relying on alphabetical ordering.
+
+**Without sort keys, Power BI will display "Profit & Tax" before "Revenue" alphabetically,
+and "G&A" before "COGS" — making the P&L completely unreadable.**
+
+#### Required Sort Key Columns
+
+| Column | Type | Purpose | Example Values |
+|---|---|---|---|
+| `Level1SortKey` | Integer | Orders the top-level P&L buckets | Total Income=1, Total Costs=2, Profit & Tax=3 |
+| `Level2SortKey` | Integer | Orders Level 2 within each Level 1 parent | COGS=1, Operating Expenses=2 (under Total Costs) |
+| `Level3SortKey` | Integer | Orders Level 3 within each Level 2 parent | Commercial Opex=1, G&A=2, R&D=3 |
+| `AccountSortKey` | Integer | Orders leaf accounts within their Level 3 parent | Recurring Revenue=1, Non-recurring Revenue=2 |
+| `HierarchySortKey` | Integer (computed) | Single composite key for full hierarchy ordering in one column | L1×1000000 + L2×10000 + L3×100 + Account |
+
+#### Sort Key Assignment Rules
+
+```
+Level1SortKey assignment:
+  Total Income    → 1
+  Total Costs     → 2
+  Profit & Tax    → 3
+
+Level2SortKey assignment (within parent Level1):
+  Under Total Income:
+    Revenue       → 1    (recurring + non-recurring combined)
+  Under Total Costs:
+    COGS          → 1
+    Operating Expenses → 2
+  Under Profit & Tax:
+    Other Income/Expense → 1
+    Tax           → 2
+    Net Profit    → 3
+
+Level3SortKey assignment (within parent Level2):
+  Under Revenue:
+    Recurring Revenue     → 1
+    Non-recurring Revenue → 2
+  Under COGS:
+    Services Delivery Costs     → 1
+    Subscription Delivery Costs → 2
+    Hardware COGS               → 3
+  Under Operating Expenses:
+    Commercial Opex    → 1
+    G&A & Overheads    → 2
+    Product & R&D Opex → 3
+  Under Other Income/Expense:
+    Financial Income  → 1
+    Financial Expense → 2
+  Under Tax:
+    Tax Expense → 1
+
+AccountSortKey assignment (within parent Level3):
+  Leaf accounts ordered by natural business reporting sequence within their Level3.
+  Use 10, 20, 30 ... spacing to allow for future insertions without full renumbering.
+```
+
+#### HierarchySortKey Formula
+
+```python
+# Computed column — always derive from Level sort keys, never hardcode
+dim_account["HierarchySortKey"] = (
+    dim_account["Level1SortKey"] * 1_000_000
+    + dim_account["Level2SortKey"] * 10_000
+    + dim_account["Level3SortKey"] * 100
+    + dim_account["AccountSortKey"]
+)
+```
+
+This gives a single integer that fully encodes the display order of any account in the
+P&L hierarchy. In Power BI, set `HierarchySortKey` as the Sort By Column for all
+account name columns.
+
+#### Full DimAccount Column Specification
+
+```python
+# DimAccount required columns — generate in this order:
+DIMACCOUNT_COLUMNS = [
+    # Keys
+    "AccountKey",          # int, surrogate PK (1-based sequential)
+    "AccountCode",         # str, e.g. "REV-001", "COGS-002"
+
+    # Hierarchy labels
+    "Level1Name",          # str, top-level P&L bucket
+    "Level2Name",          # str, sub-bucket
+    "Level3Name",          # str, account group
+    "AccountName",         # str, leaf account name
+
+    # Hierarchy path (for Power BI PATH() functions)
+    "HierarchyPath",       # str, "Level1|Level2|Level3|Account"
+
+    # Sort keys — MANDATORY, always included
+    "Level1SortKey",       # int
+    "Level2SortKey",       # int
+    "Level3SortKey",       # int
+    "AccountSortKey",      # int
+    "HierarchySortKey",    # int (computed: L1*1000000 + L2*10000 + L3*100 + Acct)
+
+    # Financial attributes
+    "AccountType",         # str: "Revenue" / "COGS" / "Operating Expense" / "Tax" / etc.
+    "NormalBalance",       # str: "Credit" (income) / "Debit" (expense/asset)
+    "IsLeafAccount",       # bool: True for accounts that receive transaction values
+    "IsCalculated",        # bool: True for subtotals (Total Income, Gross Profit, etc.)
+    "IsActive",            # bool
+
+    # Variance personality (feeds get_variance() function)
+    "VariancePersonality", # str: key into VARIANCE_PROFILE
+                           #      e.g. "Revenue", "COGS", "Operating Expense", "Tax"
+]
+
+# Example rows — P&L structure matching the screenshot reference:
+DIMACCOUNT_SAMPLE = [
+    # AccountKey, AccountCode, Level1Name,    Level2Name,          Level3Name,        AccountName,               HierarchyPath,                                       L1S, L2S, L3S, AS,  HSK,       AccountType,         NormalBalance, IsLeaf, IsCalc
+    (1,  "INC",   "Total Income",  "",                  "",                "",                        "Total Income",                                      1, 0, 0, 0, 1_000_000, "Revenue",    "Credit", False, True),
+    (2,  "REV",   "Total Income",  "Revenue",           "",                "",                        "Total Income|Revenue",                              1, 1, 0, 0, 1_010_000, "Revenue",    "Credit", False, True),
+    (3,  "RR",    "Total Income",  "Revenue",           "Recurring Rev",   "Recurring Revenue",       "Total Income|Revenue|Recurring Rev|Recurring Revenue",    1, 1, 1, 10, 1_010_110, "Revenue", "Credit", True, False),
+    (4,  "NRR",   "Total Income",  "Revenue",           "Non-recurring",   "Non-recurring Revenue",   "Total Income|Revenue|Non-recurring|Non-recurring Revenue", 1, 1, 2, 10, 1_010_210, "Non-recurring Revenue", "Credit", True, False),
+    (5,  "COST",  "Total Costs",   "",                  "",                "",                        "Total Costs",                                       2, 0, 0, 0, 2_000_000, "COGS",       "Debit",  False, True),
+    (6,  "COGS",  "Total Costs",   "COGS",              "",                "",                        "Total Costs|COGS",                                  2, 1, 0, 0, 2_010_000, "COGS",       "Debit",  False, True),
+    (7,  "SDC",   "Total Costs",   "COGS",              "Services Del.",   "Services Delivery Costs", "Total Costs|COGS|Services Del.|Services Delivery Costs", 2, 1, 1, 10, 2_010_110, "COGS",  "Debit",  True, False),
+    (8,  "SUBC",  "Total Costs",   "COGS",              "Subscription Del.","Subscription Delivery Co.","Total Costs|COGS|Subscription Del.|Subscription Delivery Co.", 2, 1, 2, 10, 2_010_210, "COGS", "Debit", True, False),
+    (9,  "HWCOGS","Total Costs",   "COGS",              "Hardware",        "Hardware COGS",           "Total Costs|COGS|Hardware|Hardware COGS",            2, 1, 3, 10, 2_010_310, "COGS",       "Debit",  True, False),
+    (10, "OPEX",  "Total Costs",   "Operating Expenses","",                "",                        "Total Costs|Operating Expenses",                    2, 2, 0, 0, 2_020_000, "Operating Expense","Debit", False, True),
+    (11, "COPEX", "Total Costs",   "Operating Expenses","Commercial Opex", "Commercial Opex",         "Total Costs|Operating Expenses|Commercial Opex|Commercial Opex", 2, 2, 1, 10, 2_020_110, "Operating Expense","Debit", True, False),
+    (12, "GAOH",  "Total Costs",   "Operating Expenses","G&A",             "G&A & Overheads",         "Total Costs|Operating Expenses|G&A|G&A & Overheads", 2, 2, 2, 10, 2_020_210, "Operating Expense","Debit", True, False),
+    (13, "RDOPEX","Total Costs",   "Operating Expenses","R&D",             "Product & R&D Opex",      "Total Costs|Operating Expenses|R&D|Product & R&D Opex", 2, 2, 3, 10, 2_020_310, "Operating Expense","Debit", True, False),
+    (14, "PNT",   "Profit & Tax",  "",                  "",                "",                        "Profit & Tax",                                      3, 0, 0, 0, 3_000_000, "Tax",        "Debit",  False, True),
+    (15, "OTHINC","Profit & Tax",  "Other Inc./Exp.",   "",                "",                        "Profit & Tax|Other Inc./Exp.",                      3, 1, 0, 0, 3_010_000, "Other Income","Credit", False, True),
+    (16, "FININC","Profit & Tax",  "Other Inc./Exp.",   "Financial Inc.",  "Financial Income",        "Profit & Tax|Other Inc./Exp.|Financial Inc.|Financial Income", 3, 1, 1, 10, 3_010_110, "Other Income","Credit", True, False),
+    (17, "FINEXP","Profit & Tax",  "Other Inc./Exp.",   "Financial Exp.",  "Financial Expense",       "Profit & Tax|Other Inc./Exp.|Financial Exp.|Financial Expense", 3, 1, 2, 10, 3_010_210, "Financial Expense","Debit", True, False),
+    (18, "TAXBKT","Profit & Tax",  "Tax",               "",                "",                        "Profit & Tax|Tax",                                  3, 2, 0, 0, 3_020_000, "Tax",        "Debit",  False, True),
+    (19, "TAXEXP","Profit & Tax",  "Tax",               "Tax",             "Tax Expense",             "Profit & Tax|Tax|Tax|Tax Expense",                  3, 2, 1, 10, 3_020_110, "Tax",        "Debit",  True, False),
+]
+
+# Power BI Sort By Column configuration (note in internal documentation):
+# AccountName   → Sort By → AccountSortKey
+# Level1Name    → Sort By → Level1SortKey
+# Level2Name    → Sort By → Level2SortKey
+# Level3Name    → Sort By → Level3SortKey
+# HierarchyPath → Sort By → HierarchySortKey
+```
+
+#### Validation
+
+```python
+def validate_dim_account_sort_keys(dim_account):
+    """Assert all sort key columns are present and HierarchySortKey is unique per leaf."""
+    required = ["Level1SortKey", "Level2SortKey", "Level3SortKey",
+                "AccountSortKey", "HierarchySortKey"]
+    missing = [c for c in required if c in dim_account.columns]  # intentional: check present
+    missing = [c for c in required if c not in dim_account.columns]
+    if missing:
+        print(f"⚠️  DIMACCOUNT SORT KEYS: Missing columns: {missing}")
+        return
+    dupes = dim_account[dim_account["IsLeafAccount"] == True]["HierarchySortKey"].duplicated()
+    if dupes.any():
+        print(f"⚠️  DIMACCOUNT SORT KEYS: {dupes.sum()} duplicate HierarchySortKey values among leaf accounts")
+    else:
+        print(f"✅ DimAccount sort keys valid — {len(dim_account)} accounts, "
+              f"HierarchySortKey unique across all leaf accounts")
+```
+
 ### Membership Table Pattern
 
 ```python
-# When use case includes memberships (e.g., Costco-like warehouse clubs, gyms, loyalty programs):
+# When use case includes memberships (e.g., Walmart-like warehouse clubs, gyms, loyalty programs):
 # DimMembership columns:
 # MembershipKey, MembershipTier, AnnualFee, Benefits (text), CashbackPct,
 # MaxHouseholdMembers, IsBusinessEligible, IsActive
@@ -1815,9 +2224,9 @@ of what the script will produce — audience, key tables, date range, and tier.
 
 ---
 
-## Costco-Style Example Mapping
+## Walmart-Style Example Mapping
 
-The Costco use case from the user's prompt maps to this skill as follows:
+The Walmart use case from the user's prompt maps to this skill as follows:
 
 | User Request Element | Tables Generated |
 |---|---|
