@@ -93,7 +93,7 @@ The user controls size and scope — the skill controls quality.
 
 ## Company Research Rule — Triggers When a Real Company Is Named
 
-If the user mentions any real company name (e.g., Walmart, IKEA, Zara, Grab, Flipkart,
+If the user mentions any real company name (e.g., Costco, IKEA, Zara, Grab, Flipkart,
 Toyota, Marriott, DoorDash, HDFC Bank, Telstra), this rule activates immediately.
 
 ### Step 1 — Research Before Anything Else
@@ -174,7 +174,7 @@ Do NOT include this section in the public documentation.
 **Never design or generate anything until all four intake questions are answered.**
 
 **Exception — Company Named + Rich Description Provided**: If the user names a real company
-AND provides a detailed use case description (like the Walmart example), treat this as a
+AND provides a detailed use case description (like the Costco example), treat this as a
 near-complete intake. Do NOT repeat questions that the description already answers. Only
 ask for dataset size and end-user persona if those are genuinely missing. Extract everything
 else from the description and company research.
@@ -201,7 +201,7 @@ KPIs the audience will interrogate. Always ask:
 > — Logistics and delivery tracking
 > — [Other — please describe]"
 
-If the user provides a rich description (like the Walmart example), treat it as the use
+If the user provides a rich description (like the Costco example), treat it as the use
 case and do NOT ask again. Extract the use case from the description.
 
 **Question 2 — Sub-Industry**
@@ -1717,11 +1717,340 @@ A complete script must:
 - Generate all dimension and fact tables in the correct order
 - Apply macro event multipliers during fact generation (not as a post-processing step)
 - Apply seasonal multipliers and discount calendar to every relevant fact row
-- Export every DataFrame to CSV with the attribution row at the top
-- Generate both documentation files
+- Export every DataFrame to CSV using `df.to_csv(path, index=False)` — first row is always the column header, no comment rows prepended (see CSV Output Rule below)
+- Generate both documentation files with full column-level data type tables
+- Run all mandatory validation checks (see Mandatory Validation Checks below)
 - Print a final summary (see below)
-- Complete in under 3 minutes for tier S, under 10 minutes for tier M,
-  under 30 minutes for tier L (on a modern laptop)
+- Complete in under 3 minutes for tier S, under 10 minutes for tier M, under 30 minutes for tier L (on a modern laptop)
+
+---
+
+## CSV Output Rule — Strict
+
+**The first row of every CSV must be the column header. No exceptions.**
+
+```python
+# ✅ CORRECT — always use this
+df.to_csv(output_path, index=False)
+
+# ❌ WRONG — never prepend comment rows to CSV
+with open(output_path, "w") as f:
+    f.write("# Copyright Logeshkumar Sivakumar\n")   # BREAKS Power BI + Fabric Plan
+    df.to_csv(f, index=False)
+```
+
+Copyright and attribution belong in:
+1. The Python script itself (as a header comment block)
+2. The internal documentation file (`[industry]_dataset_guide_internal.md`)
+
+They must NEVER appear as rows inside CSV files.
+
+---
+
+## Star Schema Rules — Always Enforce
+
+These rules apply to every fact and dimension table generated. Violations break
+Power BI relationships, Fabric Plan write-back, and model builder tools.
+
+### Rule 1 — Fact Tables Must Be Long Format (One Measure Per Row)
+
+For financial, headcount, and planning fact tables, use long (tidy) format.
+Wide format (multiple scenario columns per row) is incompatible with Fabric Plan
+write-back and DAX scenario switching.
+
+```python
+# ❌ WRONG — wide format, breaks Fabric Plan write-back
+# AccountKey | DateKey | ActualAmount | BudgetAmount | ForecastAmount
+# 1          | 202401  | 1000         | 950          | 980
+
+# ✅ CORRECT — long format, one Amount per row, ScenarioKey as FK
+# AccountKey | DateKey | ScenarioKey | Amount
+# 1          | 202401  | 1           | 1000     ← Actual
+# 1          | 202401  | 2           | 950      ← Budget
+# 1          | 202401  | 3           | 980      ← Forecast
+```
+
+This applies to: `FactFinancial`, `FactARR`, `FactHeadcount`, `FactSalesTarget`,
+`FactInventoryPlan`, and any other fact table that carries Budget/Forecast alongside Actual.
+
+`DimScenario` must always exist when long-format financial facts are present:
+```python
+DIM_SCENARIO = pd.DataFrame({
+    "ScenarioKey":  [1, 2, 3],
+    "ScenarioName": ["Actual", "Budget", "Forecast"],
+    "ScenarioType": ["Actual", "Plan", "Plan"],
+    "IsWriteback":  [False, True, True],   # Fabric Plan write-back targets
+})
+```
+
+### Rule 2 — Boolean Classifier Columns Must Become Dimensions
+
+Any boolean flag in a fact table that classifies the type of transaction must be
+replaced with a surrogate foreign key to a small dimension table.
+
+```python
+# ❌ WRONG — boolean descriptors in fact table
+# FactSalesActivity: IsNewLogo | IsRenewal | IsUpsell
+
+# ✅ CORRECT — FK to DimActivityType
+# FactSalesActivity: ActivityTypeKey → DimActivityType
+DIM_ACTIVITY_TYPE = pd.DataFrame({
+    "ActivityTypeKey":  [1, 2, 3],
+    "ActivityTypeName": ["New Logo", "Renewal", "Upsell"],
+})
+```
+
+Pattern applies to any boolean classifier: `IsReturn`, `IsOnline`, `IsPromotional`,
+`IsNewCustomer`, `IsBusiness`, etc. — all become dimension rows.
+
+**Exception**: Boolean flags that are genuinely row-level properties (not classifiers)
+may remain: `IsActive`, `IsLeafAccount`, `IsWeekend`, `IsHoliday`.
+
+### Rule 3 — Bridge Tables Contain Only Keys and Split Ratio
+
+Bridge tables (allocation bridges, department-account bridges) must contain
+only surrogate keys and the allocation percentage. No descriptor columns.
+
+```python
+# ❌ WRONG — descriptor column in bridge
+# DeptAccountBridge: DeptKey | AccountKey | AccountCode | SplitPct
+
+# ✅ CORRECT — keys and ratio only
+# DeptAccountBridge: DeptKey | AccountKey | SplitPct
+```
+
+### Rule 4 — No Object dtype Columns Except Boolean Flags
+
+After generating every fact table, assert that no column has Pandas `object` dtype
+unless it is a true string dimension column. Numeric amounts, keys, and percentages
+must be typed correctly.
+
+```python
+def validate_star_schema(df, table_name, allowed_object_cols=None):
+    """Assert no unexpected object dtype columns in a fact table."""
+    allowed_object_cols = allowed_object_cols or []
+    object_cols = [c for c in df.columns
+                   if df[c].dtype == object and c not in allowed_object_cols]
+    if object_cols:
+        print(f"⚠️  STAR SCHEMA [{table_name}]: object dtype columns: {object_cols} "
+              f"— cast to correct types before export")
+    else:
+        print(f"✅ Star schema dtype check passed — {table_name}")
+```
+
+### Rule 5 — VersionKey on All Planning Fact Tables
+
+Any dataset designed for integrated planning (Fabric Plan, Inforiver Writeback Matrix,
+or any write-back tool) must include `VersionKey` on all planning fact tables and
+`EntityKey` on financial and revenue fact tables. Both must be populated at generation
+time — never added as post-processing patches.
+
+```python
+# DimVersion — planning cycle version registry
+DIM_VERSION = pd.DataFrame({
+    "VersionKey":   [1, 2, 3, 4, 5],
+    "VersionName":  ["FY2024 Budget", "Q1 FY2024 Reforecast", "Q2 FY2024 Reforecast",
+                     "FY2025 Budget", "Q1 FY2025 Reforecast"],
+    "VersionType":  ["Annual Budget", "Quarterly Reforecast", "Quarterly Reforecast",
+                     "Annual Budget", "Quarterly Reforecast"],
+    "FiscalYear":   [2024, 2024, 2024, 2025, 2025],
+    "IsActive":     [False, False, True, False, True],
+    "CreatedDate":  ["2023-11-01", "2024-02-01", "2024-05-01", "2024-11-01", "2025-02-01"],
+})
+
+def get_version_key(scenario_name, year, month, dim_version):
+    """Maps scenario + year + month to the correct VersionKey.
+    Actuals → annual budget version for that year.
+    Forecast → active quarterly reforecast version.
+    """
+    if scenario_name == "Actual":
+        match = dim_version[
+            (dim_version["VersionType"] == "Annual Budget") &
+            (dim_version["FiscalYear"] == year)
+        ]
+    else:
+        match = dim_version[
+            (dim_version["VersionType"] == "Quarterly Reforecast") &
+            (dim_version["FiscalYear"] == year) &
+            (dim_version["IsActive"] == True)
+        ]
+    return int(match["VersionKey"].iloc[0]) if len(match) > 0 else 1
+```
+
+---
+
+## Mandatory Validation Checks
+
+**All four checks must pass before the script is considered complete.**
+Failures print as warnings but the script still exports. A failed check means
+the dataset has a structural integrity problem that must be fixed.
+
+```python
+# ══════════════════════════════════════════════════════════════════
+# MANDATORY VALIDATION SUITE — run after all tables are generated
+# ══════════════════════════════════════════════════════════════════
+
+def check_star_schema_dtypes(tables: dict):
+    """
+    Check 1 — Star Schema: No object dtype columns except allowed string columns.
+    tables: {table_name: DataFrame}
+    """
+    ALLOWED_OBJECT_COLS = {
+        # Columns that are legitimately string/object
+        "all": {"Date"},  # date objects sometimes read as object
+    }
+    all_pass = True
+    for tname, df in tables.items():
+        allowed = ALLOWED_OBJECT_COLS.get("all", set())
+        bad = [c for c in df.columns if df[c].dtype == object and c not in allowed
+               and not c.endswith("Name") and not c.endswith("Code")
+               and not c.endswith("Type") and not c.endswith("Path")
+               and not c.endswith("Reason") and not c.endswith("Status")]
+        if bad:
+            print(f"⚠️  CHECK 1 STAR SCHEMA [{tname}]: unexpected object cols: {bad}")
+            all_pass = False
+    if all_pass:
+        print("✅ Check 1 passed — Star schema dtype validation")
+
+
+def check_variance_mix(fact_financial, dim_account, min_adverse_pct=0.20):
+    """
+    Check 2 — Variance Mix: Adverse variance rows must be >= 20% of total.
+    Income adverse = VarianceAmount < 0. Cost adverse = VarianceAmount > 0.
+    """
+    if "VarianceAmount" not in fact_financial.columns:
+        print("ℹ️  Check 2 VARIANCE MIX: VarianceAmount not found — skipped")
+        return
+    income_types = {"Revenue", "Non-recurring Revenue", "Other Income"}
+    merged = fact_financial.merge(
+        dim_account[["AccountKey", "AccountType"]], on="AccountKey", how="left"
+    )
+    adverse = merged.apply(
+        lambda r: r["VarianceAmount"] < 0 if r["AccountType"] in income_types
+                  else r["VarianceAmount"] > 0, axis=1
+    ).sum()
+    pct = adverse / len(merged) if len(merged) > 0 else 0
+    if pct < min_adverse_pct:
+        print(f"⚠️  CHECK 2 VARIANCE MIX: only {pct:.1%} adverse rows "
+              f"(minimum {min_adverse_pct:.0%}) — check VARIANCE_PROFILE biases")
+    else:
+        print(f"✅ Check 2 passed — Variance mix {1-pct:.1%} favourable / {pct:.1%} adverse")
+
+
+def check_headcount_reconciliation(fact_headcount, dim_employee, latest_period_date):
+    """
+    Check 3 — Headcount Reconciliation:
+    FactHeadcount Actuals for latest period == DimEmployee IsActive count.
+    Diff must be exactly 0.
+    Rule: Actuals headcount must ALWAYS be derived from DimEmployee, never independently generated.
+    """
+    # DimEmployee active count
+    active_emp = dim_employee[
+        (dim_employee["HireDate"] <= latest_period_date) &
+        (
+            dim_employee["TerminationDate"].isna() |
+            (dim_employee["TerminationDate"] > latest_period_date)
+        )
+    ].shape[0]
+
+    # FactHeadcount Actuals for latest period
+    fact_actual = fact_headcount[
+        (fact_headcount["ScenarioKey"] == 1) &   # 1 = Actual
+        (fact_headcount["PeriodDate"] == latest_period_date)
+    ]["HeadcountValue"].sum()
+
+    diff = int(fact_actual) - active_emp
+    if diff != 0:
+        print(f"⚠️  CHECK 3 HEADCOUNT RECONCILIATION: diff = {diff} "
+              f"(FactHeadcount={int(fact_actual)}, DimEmployee active={active_emp}). "
+              f"Actuals must be derived from DimEmployee — never independently generated.")
+    else:
+        print(f"✅ Check 3 passed — Headcount reconciliation diff = 0 "
+              f"({active_emp} active employees)")
+
+
+def check_arr_waterfall(fact_arr):
+    """
+    Check 4 — ARR Waterfall:
+    ClosingARR == OpeningARR + NewARR + ExpansionARR + ContractionARR + ChurnARR.
+    Mismatches must be 0.
+    Only runs if FactARR is present in the dataset.
+    """
+    if fact_arr is None or fact_arr.empty:
+        print("ℹ️  Check 4 ARR WATERFALL: FactARR not present — skipped")
+        return
+    required = {"ClosingARR", "OpeningARR", "NewARR", "ExpansionARR",
+                "ContractionARR", "ChurnARR"}
+    missing = required - set(fact_arr.columns)
+    if missing:
+        print(f"⚠️  CHECK 4 ARR WATERFALL: Missing columns: {missing}")
+        return
+    fact_arr = fact_arr.copy()
+    fact_arr["ExpectedClosing"] = (
+        fact_arr["OpeningARR"]
+        + fact_arr["NewARR"]
+        + fact_arr["ExpansionARR"]
+        + fact_arr["ContractionARR"]   # should be negative
+        + fact_arr["ChurnARR"]          # should be negative
+    ).round(2)
+    mismatches = (
+        (fact_arr["ClosingARR"] - fact_arr["ExpectedClosing"]).abs() > 0.01
+    ).sum()
+    if mismatches > 0:
+        print(f"⚠️  CHECK 4 ARR WATERFALL: {mismatches} rows where "
+              f"ClosingARR != OpeningARR + movements")
+    else:
+        print(f"✅ Check 4 passed — ARR waterfall reconciles across "
+              f"{len(fact_arr):,} rows")
+
+
+def run_all_checks(tables, dim_account=None, dim_employee=None,
+                   fact_headcount=None, fact_financial=None,
+                   fact_arr=None, latest_period_date=None):
+    """Run all four mandatory checks. Call before printing final summary."""
+    print("\n  MANDATORY VALIDATION CHECKS")
+    print("  " + "─" * 53)
+    check_star_schema_dtypes(tables)
+    if fact_financial is not None and dim_account is not None:
+        check_variance_mix(fact_financial, dim_account)
+    if fact_headcount is not None and dim_employee is not None and latest_period_date:
+        check_headcount_reconciliation(fact_headcount, dim_employee, latest_period_date)
+    check_arr_waterfall(fact_arr)
+    print()
+```
+
+**Headcount generation rule — non-negotiable:**
+FactHeadcount Actuals (ScenarioKey=1) must be derived from DimEmployee by counting
+rows where `HireDate <= period_date AND (TerminationDate IS NULL OR TerminationDate > period_date)`
+per department per month. Never generate Actual headcount as a random or independent number.
+
+```python
+# ✅ CORRECT — derive Actuals from DimEmployee
+def derive_headcount_actuals(dim_employee, dim_date_monthly, dim_dept):
+    rows = []
+    for _, dt in dim_date_monthly.iterrows():
+        for _, dept in dim_dept.iterrows():
+            count = dim_employee[
+                (dim_employee["DepartmentKey"] == dept["DepartmentKey"]) &
+                (dim_employee["HireDate"] <= dt["Date"]) &
+                (
+                    dim_employee["TerminationDate"].isna() |
+                    (dim_employee["TerminationDate"] > dt["Date"])
+                )
+            ].shape[0]
+            rows.append({
+                "DepartmentKey":  dept["DepartmentKey"],
+                "DateKey":        dt["DateKey"],
+                "ScenarioKey":    1,  # Actual
+                "HeadcountValue": count,
+                "FullyLoadedCost": (
+                    dim_employee[
+                        dim_employee["DepartmentKey"] == dept["DepartmentKey"]
+                    ]["BaseSalary_USD"].mean() / 12 * 1.35
+                ).round(2),
+            })
+    return pd.DataFrame(rows)
+```
 
 ### Performance Guidelines
 
@@ -1785,6 +2114,8 @@ with 50 stores should not have 500 transactions per store per day for tier S.
 
 Both documentation files are generated by the Python script — not written by hand.
 
+---
+
 ### Public Document: `[industry]_dataset_guide_public.md`
 
 Audience: The person presenting the demo or showing the data (analyst, consultant, sales).
@@ -1798,21 +2129,160 @@ Required sections:
 6. Usage Notes (what the data is suitable for, what it is not)
 7. Attribution and Copyright
 
+---
+
 ### Internal Document: `[industry]_dataset_guide_internal.md`
 
-Audience: The builder / developer who generated the data (Lira and technical team).
+Audience: The builder / developer who generated the data, **and the enterprise-pbix-model-builder
+skill** which reads this document to infer column types, relationships, and measure logic.
+
+**This document is the primary contract between the dataset generator and the model builder.**
+The model builder skill reads Section 2 (Schema Details) to set column data types in the BIM file.
+If data types are missing or wrong here, the Power BI model will have incorrect column types.
 
 Required sections:
 1. Generation Parameters (industry, tier, date range, seed, geographies)
-2. Schema Details (all tables, all columns with data type, description, sample value)
+2. **Schema Details — Column Data Types (critical for Power BI model builder)**
 3. Macro Events Applied (table format: event, period, affected columns, source)
 4. Seasonality Rules Applied (table format: pattern, geography, months, lift %)
 5. Discount Engine Configuration (category rotation, peak events, band widths)
 6. Geographic Realism Notes (naming pools, currency, PPP logic)
 7. Full Relationship Map (FK → PK, cardinality, role)
-8. Generation Performance (row counts per table, total size, generation time)
-9. Known Limitations / Assumptions
-10. Attribution and Copyright
+8. **Power BI Sort By Column Configuration**
+9. Generation Performance (row counts per table, total size, generation time)
+10. Validation Check Results (all four checks, pass/fail, details)
+11. Known Limitations / Assumptions
+12. Company Research Basis (if a real company was researched — internal doc only)
+13. Attribution and Copyright
+
+---
+
+### Section 2 Schema Details — Required Format
+
+**Every table, every column must appear.** The model builder skill depends entirely on
+this section to infer correct Power BI data types. A missing column or wrong type here
+causes a broken Power BI model.
+
+For each table, generate a markdown table with this exact structure:
+
+```markdown
+#### TableName
+
+| Column | Data Type | Power BI Type | Nullable | Description | Sample Value |
+|---|---|---|---|---|---|
+| ColumnName | int64 | Whole Number | No | Surrogate primary key | 1 |
+| ColumnName | str | Text | No | ... | ... |
+```
+
+**Data Type Mapping — Python to Power BI:**
+
+| Python / Pandas dtype | Power BI Column Type | Notes |
+|---|---|---|
+| `int64`, `int32` | Whole Number | Keys, counts, sort keys |
+| `float64`, `float32` | Decimal Number | Amounts, percentages, ratios |
+| `str`, `object` (text) | Text | Names, labels, codes, paths |
+| `bool` | True/False | Boolean flags |
+| `datetime64` | Date/Time | Full timestamps |
+| `datetime.date` (Python date) | Date | Date-only columns (DateKey source) |
+| `int64` where column name ends in `Key` | Whole Number | Always whole number, never decimal |
+| `float64` where column name ends in `Pct` | Percentage (Decimal Number × 100) | Note in description: "multiply by 100 for %" |
+| `float64` where column name ends in `Amount` | Fixed Decimal Number (currency) | Note currency in description |
+
+**Full Example — DimEmployee schema block:**
+
+```markdown
+#### DimEmployee
+
+Grain: One row per employee. 8,432 rows.
+
+| Column | Data Type | Power BI Type | Nullable | Description | Sample Value |
+|---|---|---|---|---|---|
+| EmployeeKey | int64 | Whole Number | No | Surrogate PK | 1 |
+| EmployeeID | str | Text | No | Business key e.g. EMP-00001 | EMP-00042 |
+| EmployeeName | str | Text | No | Full name (ethnicity-matched to country) | Hiroshi Tanaka |
+| Gender | str | Text | No | Male / Female / Non-binary | Male |
+| Department | str | Text | No | Department name | Engineering |
+| DepartmentKey | int64 | Whole Number | No | FK to DimDepartment | 3 |
+| JobTitle | str | Text | No | Role title | Senior Engineer |
+| SeniorityLevel | str | Text | No | Canonical seniority tier | Director |
+| SeniorityLevelKey | int64 | Whole Number | No | Numeric rank 1=most senior | 3 |
+| SeniorityLevelSortKey | int64 | Whole Number | No | Sort By Column for SeniorityLevel | 3 |
+| SeniorityDepth | int64 | Whole Number | No | Depth in org hierarchy (1=C-Suite) | 3 |
+| SeniorityHierarchyPath | str | Text | No | Pipe-delimited PATH string | C-Suite\|VP\|Director |
+| Level1Label | str | Text | No | Always C-Suite tier label | C-Suite |
+| Level1SortKey | int64 | Whole Number | No | Sort By Column for Level1Label | 1 |
+| Level2Label | str | Text | Yes | VP tier label; null if C-Suite | VP |
+| Level2SortKey | int64 | Whole Number | Yes | Sort By Column for Level2Label | 2 |
+| Level3Label | str | Text | Yes | Director tier label | Director |
+| Level3SortKey | int64 | Whole Number | Yes | Sort By Column for Level3Label | 3 |
+| Level4Label | str | Text | Yes | Manager tier; null if Director or above | null |
+| Level4SortKey | int64 | Whole Number | Yes | Sort By Column for Level4Label | null |
+| Level5Label | str | Text | Yes | Senior IC tier | null |
+| Level5SortKey | int64 | Whole Number | Yes | | null |
+| Level6Label | str | Text | Yes | IC tier | null |
+| Level6SortKey | int64 | Whole Number | Yes | | null |
+| Level7Label | str | Text | Yes | Associate/Intern tier | null |
+| Level7SortKey | int64 | Whole Number | Yes | | null |
+| ManagerEmployeeKey | int64 | Whole Number | Yes | FK to self; null for C-Suite | 42 |
+| CountryKey | int64 | Whole Number | No | FK to DimGeography | 7 |
+| HireDate | datetime.date | Date | No | Date employee joined | 2022-03-15 |
+| TerminationDate | datetime.date | Date | Yes | Date employee left; null if active | null |
+| IsActive | bool | True/False | No | True if no TerminationDate or future date | True |
+| BaseSalary_USD | float64 | Fixed Decimal Number | No | Annual salary in USD | 145000.00 |
+| GeographyKey | int64 | Whole Number | No | FK to DimGeography | 12 |
+```
+
+**Section 2 generation rule:** The Python script must auto-generate Section 2 by
+inspecting each DataFrame's `.dtypes` and applying the mapping table above. Do not
+write the schema section by hand — it must be derived from the actual generated data
+to guarantee accuracy.
+
+```python
+PBI_TYPE_MAP = {
+    "int64":         "Whole Number",
+    "int32":         "Whole Number",
+    "float64":       "Decimal Number",
+    "float32":       "Decimal Number",
+    "bool":          "True/False",
+    "object":        "Text",
+    "datetime64[ns]":"Date/Time",
+    "datetime64[D]": "Date",
+}
+
+def generate_schema_section(table_name, df, descriptions=None, sample_row=None):
+    """
+    Generates the markdown schema table for one DataFrame.
+    descriptions: dict of {col: description_string}
+    sample_row: first data row as a dict (from df.iloc[0].to_dict())
+    """
+    descriptions = descriptions or {}
+    sample_row   = sample_row or (df.iloc[0].to_dict() if len(df) > 0 else {})
+
+    lines = [
+        f"#### {table_name}\n",
+        f"Grain: [describe grain]. {len(df):,} rows.\n",
+        "| Column | Data Type | Power BI Type | Nullable | Description | Sample Value |",
+        "|---|---|---|---|---|---|",
+    ]
+    for col in df.columns:
+        dtype_str  = str(df[col].dtype)
+        pbi_type   = PBI_TYPE_MAP.get(dtype_str, "Text")
+        # Override: Key columns are always Whole Number
+        if col.endswith("Key"):
+            pbi_type = "Whole Number"
+        # Override: Amount columns are Fixed Decimal Number (currency)
+        if col.endswith("Amount"):
+            pbi_type = "Fixed Decimal Number"
+        nullable   = "Yes" if df[col].isna().any() else "No"
+        desc       = descriptions.get(col, "")
+        sample     = sample_row.get(col, "")
+        if sample is None or (isinstance(sample, float) and np.isnan(sample)):
+            sample = "null"
+        lines.append(
+            f"| {col} | {dtype_str} | {pbi_type} | {nullable} | {desc} | {sample} |"
+        )
+    return "\n".join(lines)
+```
 
 ---
 
@@ -1856,6 +2326,15 @@ Required sections:
   ✅ FK integrity               : All foreign keys validated
   ✅ Date coverage              : All fact dates within DimDate
 
+  MANDATORY VALIDATION CHECKS
+  ─────────────────────────────────────────────────────────
+  Check 1 — Star Schema dtypes    ✅ / ⚠️   No unexpected object dtype cols
+  Check 2 — Variance mix          ✅ / ⚠️   [xx]% favourable / [xx]% adverse
+  Check 3 — Headcount recon       ✅ / ⚠️   diff = 0 ([n] active employees)
+  Check 4 — ARR waterfall         ✅ / ⚠️   [n] rows reconcile / skipped
+  ─────────────────────────────────────────────────────────
+  ⚠️ VALIDATION WARNINGS: [n]   (only shown if any check fails)
+
   RECONCILIATION
   ─────────────────────────────────────────────────────────
   [Check name]                  [Status: ✅ / ⚠️]   [Details]
@@ -1863,7 +2342,7 @@ Required sections:
   Inventory Flow                ✅                  [n] snapshots reconcile
   Payroll Gross/Net             ✅                  [n] rows reconcile
   Returns vs Sales              ✅                  [n] returns reference real lines
-  Variance Mix (Budget/Actual)  ✅                  [xx]% favourable / [xx]% adverse (semantic check)
+  Variance Mix (Budget/Actual)  ✅                  [xx]% favourable / [xx]% adverse
   DimAccount Sort Keys          ✅                  [n] accounts, HierarchySortKey unique
   [any additional pairs]        ✅ / ⚠️             ...
   ─────────────────────────────────────────────────────────
@@ -2174,10 +2653,151 @@ def validate_dim_account_sort_keys(dim_account):
               f"HierarchySortKey unique across all leaf accounts")
 ```
 
+### DimEmployee with Hierarchy and Level Sort Keys
+
+Every DimEmployee must include:
+- A self-referencing `ManagerEmployeeKey` for org chart drill-down
+- Pre-computed `SeniorityHierarchyPath` for Power BI `PATH()` functions
+- `SeniorityDepth` integer for level-based filtering
+- **One column per seniority level** with a corresponding sort key, so Power BI can
+  show the org pyramid in the correct top-down order without alphabetical interference
+
+#### Seniority Level Columns
+
+| Column | Type | Description | Example |
+|---|---|---|---|
+| `SeniorityLevel` | str | The employee's seniority label | `"Director"` |
+| `SeniorityLevelKey` | int | Numeric rank (1 = most senior) | `4` |
+| `SeniorityLevelSortKey` | int | Same as Key — used as Sort By Column in Power BI | `4` |
+| `Level1Label` | str | Always the C-Suite tier label for this employee | `"C-Suite"` |
+| `Level1SortKey` | int | Always `1` for C-Suite | `1` |
+| `Level2Label` | str | VP/SVP tier label (null if employee is C-Suite) | `"VP"` |
+| `Level2SortKey` | int | `2` for VP tier | `2` |
+| `Level3Label` | str | Director tier label (null if above Director) | `"Director"` |
+| `Level3SortKey` | int | `3` for Director tier | `3` |
+| `Level4Label` | str | Manager tier label (null if above Manager) | `null` |
+| `Level4SortKey` | int | `4` for Manager tier | `null` |
+| `Level5Label` | str | Senior IC label (null if above Senior IC) | `null` |
+| `Level5SortKey` | int | `5` | `null` |
+| `Level6Label` | str | IC label | `null` |
+| `Level6SortKey` | int | `6` | `null` |
+| `Level7Label` | str | Associate / Intern label | `null` |
+| `Level7SortKey` | int | `7` | `null` |
+| `SeniorityDepth` | int | Depth of this employee in hierarchy | `3` (Director = level 3) |
+| `SeniorityHierarchyPath` | str | Pipe-delimited path from root | `"C-Suite\|VP\|Director"` |
+| `ManagerEmployeeKey` | int | FK to self (EmployeeKey of manager), null for C-Suite | `42` |
+
+#### Seniority Order Reference
+
+```python
+SENIORITY_ORDER = {
+    "C-Suite":         {"key": 1, "depth": 1},
+    "SVP":             {"key": 2, "depth": 2},
+    "VP":              {"key": 3, "depth": 2},
+    "Director":        {"key": 4, "depth": 3},
+    "Senior Manager":  {"key": 5, "depth": 4},
+    "Manager":         {"key": 6, "depth": 4},
+    "Senior":          {"key": 7, "depth": 5},
+    "Individual Contributor": {"key": 8, "depth": 6},
+    "Associate":       {"key": 9, "depth": 7},
+    "Intern":          {"key": 10, "depth": 7},
+}
+
+# Hierarchy path by seniority — pre-compute per employee
+SENIORITY_PATH_MAP = {
+    "C-Suite":         "C-Suite",
+    "SVP":             "C-Suite|SVP",
+    "VP":              "C-Suite|VP",
+    "Director":        "C-Suite|VP|Director",
+    "Senior Manager":  "C-Suite|VP|Director|Senior Manager",
+    "Manager":         "C-Suite|VP|Director|Manager",
+    "Senior":          "C-Suite|VP|Director|Manager|Senior",
+    "Individual Contributor": "C-Suite|VP|Director|Manager|IC",
+    "Associate":       "C-Suite|VP|Director|Manager|IC|Associate",
+    "Intern":          "C-Suite|VP|Director|Manager|IC|Intern",
+}
+```
+
+#### Level Column Generation Pattern
+
+```python
+def build_employee_level_columns(seniority_level: str) -> dict:
+    """
+    Returns all LevelN columns for a given seniority level.
+    Levels above the employee's own level are populated.
+    Levels at or below their level are null.
+    SortKey columns mirror their Label columns for Power BI Sort By Column.
+    """
+    LEVEL_LADDER = [
+        ("C-Suite",   1),
+        ("VP",        2),   # SVP collapses into VP tier for column purposes
+        ("Director",  3),
+        ("Manager",   4),   # Senior Manager collapses into Manager tier
+        ("Senior",    5),
+        ("IC",        6),
+        ("Associate", 7),
+    ]
+
+    # Map any variant to the canonical level-column tier
+    CANONICAL = {
+        "C-Suite": 1, "SVP": 2, "VP": 2,
+        "Director": 3,
+        "Senior Manager": 4, "Manager": 4,
+        "Senior": 5,
+        "Individual Contributor": 6,
+        "Associate": 7, "Intern": 7,
+    }
+    emp_depth = CANONICAL.get(seniority_level, 6)
+
+    result = {
+        "SeniorityLevel":    seniority_level,
+        "SeniorityLevelKey": emp_depth,
+        "SeniorityLevelSortKey": emp_depth,
+        "SeniorityDepth":    emp_depth,
+        "SeniorityHierarchyPath": SENIORITY_PATH_MAP.get(seniority_level, seniority_level),
+    }
+
+    for label, tier_num in LEVEL_LADDER:
+        col_label = f"Level{tier_num}Label"
+        col_sort  = f"Level{tier_num}SortKey"
+        if tier_num <= emp_depth:
+            result[col_label] = label
+            result[col_sort]  = tier_num
+        else:
+            result[col_label] = None
+            result[col_sort]  = None
+
+    return result
+
+# Apply when building DimEmployee:
+# dim_employee = dim_employee.join(
+#     pd.DataFrame(
+#         dim_employee["SeniorityLevel"].apply(build_employee_level_columns).tolist()
+#     )
+# )
+```
+
+#### Power BI Sort By Column Configuration
+
+```
+SeniorityLevel      → Sort By → SeniorityLevelSortKey
+Level1Label         → Sort By → Level1SortKey
+Level2Label         → Sort By → Level2SortKey
+Level3Label         → Sort By → Level3SortKey
+Level4Label         → Sort By → Level4SortKey
+Level5Label         → Sort By → Level5SortKey
+Level6Label         → Sort By → Level6SortKey
+Level7Label         → Sort By → Level7SortKey
+SeniorityHierarchyPath → Sort By → SeniorityLevelSortKey
+```
+
+Document these Sort By Column assignments in `[industry]_dataset_guide_internal.md`
+under a dedicated **Power BI Sort By Column Configuration** section.
+
 ### Membership Table Pattern
 
 ```python
-# When use case includes memberships (e.g., Walmart-like warehouse clubs, gyms, loyalty programs):
+# When use case includes memberships (e.g., Costco-like warehouse clubs, gyms, loyalty programs):
 # DimMembership columns:
 # MembershipKey, MembershipTier, AnnualFee, Benefits (text), CashbackPct,
 # MaxHouseholdMembers, IsBusinessEligible, IsActive
@@ -2224,9 +2844,9 @@ of what the script will produce — audience, key tables, date range, and tier.
 
 ---
 
-## Walmart-Style Example Mapping
+## Costco-Style Example Mapping
 
-The Walmart use case from the user's prompt maps to this skill as follows:
+The Costco use case from the user's prompt maps to this skill as follows:
 
 | User Request Element | Tables Generated |
 |---|---|
