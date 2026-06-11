@@ -32,8 +32,10 @@ workshops, tool showcases, and hackathons. They are deliberately realistic - not
 | Regional product affinity | Products are weighted by regional preference. Junk food sells more in North America; instant noodles sell more in SE Asia; alcohol is zero in Middle East |
 | Zero reconciliation | Every connected value pair (order header vs lines, inventory in vs out, gross vs net pay, returns vs sales) reconciles to zero |
 | Mixed budget/actual variance | Revenue lines are 60-70% favourable, cost lines 55-65% unfavourable - never all-positive or all-negative. Variance bands widen during macro shock periods |
-| Correct variance direction (V3) | Budget is derived FROM Actual using `Budget = Actual / (1 + bias)`. Income accounts use positive bias (Actual beats Budget = favourable). Cost accounts use negative bias (Actual underspends Budget = favourable). V2 bug (inverted direction) is fixed. |
-| DimAccount sort keys | Five sort key columns added to every DimAccount: Level1SortKey, Level2SortKey, Level3SortKey, AccountSortKey, and HierarchySortKey (composite: L1×1M + L2×10K + L3×100 + Account). Enables correct P&L display order in Power BI without alphabetical fallback. |
+| Correct variance direction (V3) | Budget derived FROM Actual: `Budget = Actual / (1 + bias)`. Income accounts use positive bias, cost accounts use negative bias. |
+| DimAccount sort keys | Five sort key columns on every DimAccount for correct P&L display order in Power BI. |
+| Integrated ledger | When DimAccount is present, FactFinancial derives from upstream facts. Revenue from FactARR, NRR from FactSalesActivity, payroll and COGS from FactHeadcount via bridge. Independent generation is last resort only. |
+| 10 mandatory validation checks | Integrated planning datasets run all 10 checks: star schema (x3), variance mix, headcount reconciliation, ARR waterfall, payroll reconciliation, COGS reconciliation, revenue reconciliation, NRR reconciliation. Any warning stops delivery. |
 | Macro event engine | Real-world disruptions (supply chain crisis, inflation surge, COVID impact) are applied as time-bounded multipliers across geographies and categories |
 | Seasonal accuracy | Seasonality is hemisphere-aware. Australian summer is December, not June. Diwali affects South Asia and its diaspora. Ramadan follows the lunar calendar |
 | Discount rotation | Max 15-25% of SKUs are discounted in any week. Discounts rotate by category and align with seasonal events |
@@ -283,9 +285,11 @@ attribution block automatically.
  
 | Version | Date | Changes |
 |---|---|---|
-| 1.2 | June 2026 | Added star schema rules (long-format facts, boolean→dimension, bridge table cleanup, VersionKey/EntityKey for planning); DimEmployee level columns with sort keys (Level1–7 label+sort pairs, SeniorityHierarchyPath, ManagerEmployeeKey); four mandatory validation checks (star schema dtypes, variance mix, headcount reconciliation, ARR waterfall); CSV output rule (no comment rows); documentation schema section now generates full column data-type table for Power BI model builder compatibility. |
-| 1.1 | June 2026 | Change 1: Fixed inverted variance bug (V2 set Budget = Actual × bias; V3 corrects to Budget = Actual / (1 + bias), ensuring Income positive bias = favourable and Cost negative bias = favourable). Change 2: Added five DimAccount sort key columns (Level1SortKey, Level2SortKey, Level3SortKey, AccountSortKey, HierarchySortKey) for correct P&L display order in Power BI. |
-| 1.0 | May 2026 | Initial release - global geography, size weights, regional affinity, zero reconciliation, company research, dynamic table selection |
+| 1.4 | June 2026 | Integrated ledger rules (Rules 7–11): FactFinancial built last, derives from FactARR (revenue), FactSalesActivity (NRR), FactHeadcount via bridge (payroll + COGS). Mandatory build order: FactARR → FactSalesActivity → FactHeadcount → FactFinancial. INDEPENDENT_BASE restricted to accounts with no upstream source. Bridge-covered accounts skip guard prevents default-amount rows. 10-check validate_all() replacing 4-check run_all_checks() for integrated planning datasets. |
+| 1.3 | June 2026 | Rule 6: Employee-grain FactHeadcount. Probabilistic Budget/Forecast inclusion via OVERHIRE_MULTIPLIER. |
+| 1.2 | June 2026 | Star schema rules; DimEmployee level columns with sort keys; four mandatory validation checks; CSV output rule; documentation schema data-type tables; UTF-8 encoding rule. |
+| 1.1 | June 2026 | Fixed inverted variance direction. Added DimAccount sort key columns. |
+| 1.0 | May 2026 | Initial release. |
 
 ---
 
