@@ -1747,6 +1747,54 @@ They must NEVER appear as rows inside CSV files.
 
 ---
 
+## File Encoding Rule — Always UTF-8
+
+**Every file write in the script must explicitly specify `encoding="utf-8"`.**
+
+Windows uses `cp1252` as its default codec, which cannot encode many Unicode characters
+that appear naturally in generated content — em dashes, minus signs (`\u2212`), smart
+quotes, degree symbols, non-ASCII names (Müller, Pérez, Sato), currency symbols (₹, ¥, €),
+and any APAC or Middle Eastern names. Without explicit UTF-8, the script crashes on Windows
+with `UnicodeEncodeError`.
+
+```python
+# ✅ CORRECT — explicit UTF-8 on every write
+
+# Documentation files (pathlib)
+Path("output/doc.md").write_text(doc_content, encoding="utf-8")
+
+# Documentation files (open())
+with open(output_path, "w", encoding="utf-8") as f:
+    f.write(doc_content)
+
+# CSV files
+df.to_csv(output_path, index=False, encoding="utf-8-sig")
+# Note: use "utf-8-sig" (UTF-8 with BOM) for CSV — Excel and Power BI on Windows
+# open UTF-8-sig correctly and display special characters without garbling.
+# Plain "utf-8" works for everything else.
+
+# ❌ WRONG — relying on system default
+Path("output/doc.md").write_text(doc_content)       # crashes on Windows with cp1252
+open(output_path, "w").write(doc_content)           # crashes on Windows
+df.to_csv(output_path, index=False)                 # may corrupt non-ASCII names in CSV
+```
+
+**Rule**: The generated Python script must use `encoding="utf-8"` on all
+`open()`, `Path.write_text()`, and `Path.read_text()` calls, and
+`encoding="utf-8-sig"` on all `df.to_csv()` calls. No exceptions.
+
+This must also be stated in the script's configuration block comment:
+
+```python
+# ─── OUTPUT ENCODING ──────────────────────────────────────────────
+# All files written with explicit UTF-8 encoding.
+# CSVs use utf-8-sig (UTF-8 with BOM) for Excel/Power BI compatibility on Windows.
+# Documentation files use utf-8.
+# Do NOT rely on system default encoding — this script is cross-platform.
+```
+
+---
+
 ## Star Schema Rules — Always Enforce
 
 These rules apply to every fact and dimension table generated. Violations break
@@ -1877,13 +1925,636 @@ def get_version_key(scenario_name, year, month, dim_version):
     return int(match["VersionKey"].iloc[0]) if len(match) > 0 else 1
 ```
 
----
+### Rule 6 — FactHeadcount Grain When DimEmployee Is Present
 
-## Mandatory Validation Checks
+**When a dataset includes DimEmployee, FactHeadcount must be at employee grain —
+one row per active employee per month per scenario. Never aggregate to department
+grain if DimEmployee exists.**
+
+Department-grain headcount cuts the direct analytical link between DimEmployee and
+the fact layer. With `EmployeeKey` as a foreign key on FactHeadcount, every Power BI
+visual can slice headcount and cost by any DimEmployee attribute — seniority level,
+gender, hire cohort, geography, department — without a separate bridge or DAX workaround.
+
+#### Grain Decision Rule
+
+```
+DimEmployee present in dataset?
+  → YES → FactHeadcount grain: EmployeeKey | DateKey | ScenarioKey
+           One row per active employee per month per scenario.
+           DepartmentKey still included as a column (denormalised from DimEmployee)
+           but it is NOT the grain.
+
+  → NO  → FactHeadcount grain: DepartmentKey | DateKey | ScenarioKey
+           Department-level aggregation acceptable only when no employee dimension exists.
+```
+
+#### Actuals — Single Source of Truth from DimEmployee
+
+```python
+# ✅ CORRECT — Actuals at employee grain, derived from DimEmployee
+def build_headcount_actuals(dim_employee, dim_date_monthly):
+    """
+    One row per active employee per month.
+    Active = HireDate <= period_date AND (TerminationDate IS NULL OR > period_date).
+    HeadcountValue is always 1.0 — one employee is one unit of headcount.
+    FullyLoadedCost derived from that employee's BaseSalary_USD — single source of truth.
+    """
+    rows = []
+    for _, dt in dim_date_monthly.iterrows():
+        period = dt["Date"]
+        active = dim_employee[
+            (dim_employee["HireDate"] <= period) &
+            (
+                dim_employee["TerminationDate"].isna() |
+                (dim_employee["TerminationDate"] > period)
+            )
+        ]
+        for _, emp in active.iterrows():
+            rows.append({
+                "EmployeeKey":      emp["EmployeeKey"],
+                "DepartmentKey":    emp["DepartmentKey"],   # denormalised for convenience
+                "DateKey":          dt["DateKey"],
+                "ScenarioKey":      1,                      # 1 = Actual
+                "VersionKey":       get_version_key("Actual", dt["Year"],
+                                                    dt["MonthNum"], dim_version),
+                "HeadcountValue":   1.0,                    # always 1 per employee row
+                "FullyLoadedCost":  round(emp["BaseSalary_USD"] / 12 * 1.35, 2),
+            })
+    return pd.DataFrame(rows)
+```
+
+#### Budget and Forecast — Probabilistic Inclusion, Not Synthetic Numbers
+
+For Budget and Forecast rows, do NOT generate synthetic headcount numbers or random
+employee counts. Instead, use **probabilistic inclusion** based on the over-hire
+multiplier — each active Actual employee row has a probability of appearing in the
+Budget/Forecast scenario determined by the multiplier for that year.
+
+```python
+# Over-hire multipliers by year — encodes the variance narrative
+# > 1.0 means Budget/Forecast planned MORE headcount than Actual (over-hire expectation)
+# < 1.0 means Budget/Forecast planned LESS (lean planning after correction)
+OVERHIRE_MULTIPLIER = {
+    2022: 1.00,   # No over-hire in 2022 baseline
+    2023: 1.06,   # Budget assumed 6% more headcount than materialised
+    2024: 1.16,   # Peak hiring plan vs reality gap
+    2025: 1.20,   # Largest gap — aggressive hiring plans vs slowdown
+    2026: 1.08,   # Correction underway
+    2027: 1.03,   # Near-normalised
+    2028: 1.00,   # Fully normalised
+}
+
+def build_headcount_budget_forecast(dim_employee, dim_date_monthly, scenario_key,
+                                    scenario_name, dim_version):
+    """
+    Generates Budget or Forecast headcount at employee grain using probabilistic inclusion.
+
+    For each active employee in a given month, the employee is included in the
+    Budget/Forecast scenario with probability = min(1.0, overhire_multiplier).
+    When multiplier > 1.0, additional synthetic 'planned but not hired' rows are
+    appended using EmployeeKey = None (or a placeholder range) to represent
+    headcount that was budgeted but never materialised.
+
+    This preserves DimEmployee as the single source of truth:
+    - Real employees appear with real cost data
+    - Planned-but-not-hired rows use department average cost, not a random number
+    """
+    rows = []
+    rng  = np.random.default_rng(42)
+
+    for _, dt in dim_date_monthly.iterrows():
+        period = dt["Date"]
+        year   = dt["Year"]
+        mult   = OVERHIRE_MULTIPLIER.get(year, 1.0)
+        # inclusion_prob: if mult=1.16, each employee has 100% chance of being in Budget,
+        # and 16% extra phantom rows are added per department
+        inclusion_prob = min(1.0, 1.0 / mult)   # actual / budget = 1/mult
+
+        active = dim_employee[
+            (dim_employee["HireDate"] <= period) &
+            (
+                dim_employee["TerminationDate"].isna() |
+                (dim_employee["TerminationDate"] > period)
+            )
+        ]
+
+        version_key = get_version_key(scenario_name, year, dt["MonthNum"], dim_version)
+
+        # Step 1 — include real employees probabilistically
+        for _, emp in active.iterrows():
+            if rng.random() <= inclusion_prob:
+                rows.append({
+                    "EmployeeKey":    emp["EmployeeKey"],
+                    "DepartmentKey":  emp["DepartmentKey"],
+                    "DateKey":        dt["DateKey"],
+                    "ScenarioKey":    scenario_key,
+                    "VersionKey":     version_key,
+                    "HeadcountValue": 1.0,
+                    "FullyLoadedCost": round(emp["BaseSalary_USD"] / 12 * 1.35, 2),
+                    "IsPlannedOnly":  False,   # real employee
+                })
+
+        # Step 2 — add phantom 'planned but not hired' rows when mult > 1.0
+        if mult > 1.0:
+            phantom_count = int(round(len(active) * (mult - 1.0)))
+            for dept_key, dept_grp in active.groupby("DepartmentKey"):
+                dept_phantom = max(0, int(round(
+                    len(dept_grp) * (mult - 1.0)
+                )))
+                avg_cost = dept_grp["BaseSalary_USD"].mean() / 12 * 1.35
+                for _ in range(dept_phantom):
+                    rows.append({
+                        "EmployeeKey":    None,             # no real employee — planned only
+                        "DepartmentKey":  dept_key,
+                        "DateKey":        dt["DateKey"],
+                        "ScenarioKey":    scenario_key,
+                        "VersionKey":     version_key,
+                        "HeadcountValue": 1.0,
+                        "FullyLoadedCost": round(avg_cost, 2),
+                        "IsPlannedOnly":  True,             # planned but not materialised
+                    })
+
+    return pd.DataFrame(rows)
+```
+
+#### FactHeadcount Column Specification
+
+```python
+FACTHEADCOUNT_COLUMNS = [
+    "EmployeeKey",      # int64 (nullable) — FK to DimEmployee; null for planned-only rows
+    "DepartmentKey",    # int64            — FK to DimDepartment (denormalised from DimEmployee)
+    "DateKey",          # int64            — FK to DimDate
+    "ScenarioKey",      # int64            — FK to DimScenario (1=Actual, 2=Budget, 3=Forecast)
+    "VersionKey",       # int64            — FK to DimVersion
+    "HeadcountValue",   # float64          — always 1.0 per employee row; sum() = total headcount
+    "FullyLoadedCost",  # float64          — monthly cost in USD (BaseSalary / 12 × 1.35)
+    "IsPlannedOnly",    # bool             — True for phantom Budget/Forecast rows with no EmployeeKey
+]
+# Note: EmployeeKey is nullable (int64 with pd.NA) to support IsPlannedOnly rows.
+# Use pandas nullable integer: pd.array([1, 2, None], dtype="Int64") not numpy int64.
+```
+
+#### Validation Update for Check 3
+
+The headcount reconciliation check must now validate at employee grain:
+
+```python
+def check_headcount_reconciliation(fact_headcount, dim_employee, latest_period_date):
+    """
+    Updated for employee-grain FactHeadcount.
+    Assert: count of distinct non-null EmployeeKey rows in FactHeadcount Actuals
+    for latest period == count of active employees in DimEmployee for same period.
+    Diff must be exactly 0.
+    """
+    # DimEmployee active count
+    active_emp_keys = set(dim_employee[
+        (dim_employee["HireDate"] <= latest_period_date) &
+        (
+            dim_employee["TerminationDate"].isna() |
+            (dim_employee["TerminationDate"] > latest_period_date)
+        )
+    ]["EmployeeKey"])
+
+    # FactHeadcount Actuals — non-null EmployeeKeys only (excludes IsPlannedOnly rows)
+    fact_keys = set(
+        fact_headcount[
+            (fact_headcount["ScenarioKey"] == 1) &
+            (fact_headcount["DateKey"] == int(latest_period_date.strftime("%Y%m%d"))) &
+            (fact_headcount["EmployeeKey"].notna())
+        ]["EmployeeKey"]
+    )
+
+    missing_from_fact = active_emp_keys - fact_keys
+    extra_in_fact     = fact_keys - active_emp_keys
+
+    if missing_from_fact or extra_in_fact:
+        print(f"⚠️  CHECK 3 HEADCOUNT RECONCILIATION: "
+              f"{len(missing_from_fact)} active employees missing from FactHeadcount, "
+              f"{len(extra_in_fact)} EmployeeKeys in FactHeadcount not in DimEmployee.")
+    else:
+        print(f"✅ Check 3 passed — Headcount reconciliation diff = 0 "
+              f"({len(active_emp_keys)} active employees, all present in FactHeadcount Actuals)")
+```
 
 **All four checks must pass before the script is considered complete.**
 Failures print as warnings but the script still exports. A failed check means
 the dataset has a structural integrity problem that must be fixed.
+
+---
+
+## Integrated Ledger Rules — When DimAccount Is Present
+
+When a dataset includes `DimAccount`, every other fact table becomes a potential
+source for `FactFinancial`. Independent random generation of financial amounts must
+be the fallback of last resort — not the default. The rule is simple:
+
+**If a source fact table exists for an account, derive from it. Never generate independently.**
+
+### Build Order — Mandatory
+
+```
+FactARR → FactSalesActivity → FactHeadcount → FactFinancial
+```
+
+`FactFinancial` is always the last table built. Its function signature must accept
+all upstream fact tables as parameters:
+
+```python
+def build_fact_financial(
+    fact_arr,           # revenue derivation source
+    fact_sales,         # NRR derivation source
+    fact_headcount,     # payroll and COGS derivation source
+    dim_account,
+    dim_bridge,
+    dim_product,
+    dim_customer,
+    dim_version,
+    shock_date_ranges,
+    rng=None,
+):
+```
+
+Document the build order in the script's module-level comment block:
+
+```python
+# ─── GENERATION ORDER ────────────────────────────────────────────────────────
+# 1. Dimensions (DimDate, DimGeography, DimProduct, DimEmployee, ...)
+# 2. FactARR            — ARR movements by product / customer / geo / scenario
+# 3. FactSalesActivity  — NRR and transactional revenue, all 3 scenarios
+# 4. FactHeadcount      — employee grain, all 3 scenarios, derived from DimEmployee
+# 5. FactFinancial      — LAST. Derives from FactARR, FactSalesActivity, FactHeadcount.
+#                         Falls back to independent generation only for accounts
+#                         with no upstream fact source.
+# ─────────────────────────────────────────────────────────────────────────────
+```
+
+### Rule 7 — Revenue Accounts Derive From FactARR
+
+Every product in `DimProduct` must carry a `RevenueAccountCode` column that maps it
+to a leaf account in `DimAccount`. This is the join key between `FactARR` and
+`FactFinancial` revenue lines. Without it, revenue derivation cannot be automated.
+
+```python
+# DimProduct required column:
+# RevenueAccountCode  str  — maps to DimAccount.AccountCode for the revenue leaf account
+# e.g. "RR-CORE", "RR-ADDON", "NL-ENT", "EX-SEAT"
+
+# Derivation rules for recurring revenue leaf accounts:
+REV_DERIVATION_RULES = {
+    # AccountCode: (FactARR column, grouping logic)
+    "RR-CORE":  ("ClosingARR",   "DimProduct.RevenueAccountCode == 'RR-CORE'"),
+    "RR-ADDON": ("ClosingARR",   "DimProduct.RevenueAccountCode == 'RR-ADDON'"),
+    "RR-SUP":   ("ClosingARR",   "DimProduct.RevenueAccountCode == 'RR-SUP'"),
+    "NL-ENT":   ("NewARR",       "DimCustomer.CustomerSegment == 'Enterprise'"),
+    "NL-MM":    ("NewARR",       "DimCustomer.CustomerSegment == 'Mid-Market'"),
+    "NL-SMB":   ("NewARR",       "DimCustomer.CustomerSegment == 'SMB'"),
+    "EX-SEAT":  ("ExpansionARR", "50% of total ExpansionARR"),
+    "EX-MOD":   ("ExpansionARR", "50% of total ExpansionARR"),
+}
+```
+
+Build a `rev_lookup` dictionary before generating FactFinancial rows:
+
+```python
+def build_rev_lookup(fact_arr, dim_product, dim_customer):
+    """
+    Returns a dict: {(DateKey, GeoKey, ScenarioKey, AccountKey): amount}
+    Pre-computed once; consumed row-by-row in build_fact_financial.
+    """
+    lookup = {}
+    # Recurring revenue — group FactARR by RevenueAccountCode via DimProduct
+    arr_prod = fact_arr.merge(
+        dim_product[["ProductKey", "RevenueAccountCode"]], on="ProductKey", how="left"
+    )
+    rr_grp = arr_prod.groupby(
+        ["DateKey", "GeoKey", "ScenarioKey", "RevenueAccountCode"]
+    )["ClosingARR"].sum().reset_index()
+    for _, row in rr_grp.iterrows():
+        acct = dim_account.loc[
+            dim_account["AccountCode"] == row["RevenueAccountCode"], "AccountKey"
+        ]
+        if len(acct):
+            lookup[(row["DateKey"], row["GeoKey"], row["ScenarioKey"],
+                    int(acct.iloc[0]))] = row["ClosingARR"]
+
+    # New logo — group FactARR.NewARR by customer segment
+    arr_cust = fact_arr.merge(
+        dim_customer[["CustomerKey", "CustomerSegment"]], on="CustomerKey", how="left"
+    )
+    seg_map = {"Enterprise": "NL-ENT", "Mid-Market": "NL-MM", "SMB": "NL-SMB"}
+    nl_grp = arr_cust.groupby(
+        ["DateKey", "GeoKey", "ScenarioKey", "CustomerSegment"]
+    )["NewARR"].sum().reset_index()
+    for _, row in nl_grp.iterrows():
+        code = seg_map.get(row["CustomerSegment"])
+        if code:
+            acct = dim_account.loc[dim_account["AccountCode"] == code, "AccountKey"]
+            if len(acct):
+                lookup[(row["DateKey"], row["GeoKey"], row["ScenarioKey"],
+                        int(acct.iloc[0]))] = row["NewARR"]
+
+    # Expansion — split 50/50 between EX-SEAT and EX-MOD
+    ex_grp = fact_arr.groupby(
+        ["DateKey", "GeoKey", "ScenarioKey"]
+    )["ExpansionARR"].sum().reset_index()
+    for _, row in ex_grp.iterrows():
+        for code in ["EX-SEAT", "EX-MOD"]:
+            acct = dim_account.loc[dim_account["AccountCode"] == code, "AccountKey"]
+            if len(acct):
+                lookup[(row["DateKey"], row["GeoKey"], row["ScenarioKey"],
+                        int(acct.iloc[0]))] = row["ExpansionARR"] * 0.5
+
+    return lookup
+```
+
+### Rule 8 — NRR Accounts Derive From FactSalesActivity
+
+NRR leaf accounts (implementation, training, migration, professional services revenue)
+must derive from `FactSalesActivity.Revenue` grouped by `DimProduct.RevenueAccountCode`.
+
+**FactSalesActivity must carry all three scenarios.** If the source fact table only
+has Actuals (`ScenarioKey=1`), Budget and Forecast rows must be synthetically generated
+using `get_variance()` before `FactFinancial` derivation runs. These rows use
+`CustomerKey=0` (no customer grain) for planning-level aggregates:
+
+```python
+def ensure_all_scenarios(fact_sales, dim_version, shock_date_ranges, rng=None):
+    """
+    If FactSalesActivity only has ScenarioKey=1 (Actuals), generate Budget and
+    Forecast aggregate rows (CustomerKey=0) using the variance engine.
+    Returns the full FactSalesActivity with all 3 scenarios.
+    """
+    existing_scenarios = set(fact_sales["ScenarioKey"].unique())
+    if {2, 3}.issubset(existing_scenarios):
+        return fact_sales   # already complete
+
+    rng = rng or np.random.default_rng(42)
+    # Aggregate Actuals to (DateKey, GeoKey, ProductKey) grain for variance derivation
+    actuals_agg = fact_sales[fact_sales["ScenarioKey"] == 1].groupby(
+        ["DateKey", "GeoKey", "ProductKey"]
+    )["Revenue"].sum().reset_index()
+
+    synthetic_rows = []
+    for scenario_key, scenario_name in [(2, "Budget"), (3, "Forecast")]:
+        for _, row in actuals_agg.iterrows():
+            budget_rev = get_variance(
+                row["Revenue"], "Non-recurring Revenue", scenario_name,
+                is_shock_period=False, rng=rng
+            )
+            synthetic_rows.append({
+                "SalesActivityKey": None,
+                "CustomerKey":      0,          # aggregate — no customer grain
+                "ProductKey":       row["ProductKey"],
+                "GeoKey":           row["GeoKey"],
+                "DateKey":          row["DateKey"],
+                "ScenarioKey":      scenario_key,
+                "VersionKey":       get_version_key(scenario_name,
+                                        row["DateKey"] // 10000,   # year from DateKey
+                                        (row["DateKey"] % 10000) // 100,
+                                        dim_version),
+                "Revenue":          budget_rev,
+                "ActivityTypeKey":  0,          # aggregate row — no activity type
+            })
+
+    return pd.concat([fact_sales, pd.DataFrame(synthetic_rows)], ignore_index=True)
+```
+
+NRR split rule — `NRR-IMPL` vs `NRR-ENT`: implementation revenue splits 40% to
+standard tier (`NRR-IMPL`) and 60% to enterprise tier (`NRR-ENT`). Hard-code this
+ratio in the generator and document it in the internal guide.
+
+### Rule 9 — COGS Delivery Accounts Derive From FactHeadcount via Bridge
+
+COGS accounts where cost derives from delivery headcount (e.g. `SDC-PS` for
+Professional Services, `SDC-CS` for Customer Success) must use the same bridge
+derivation path as payroll accounts. They are NOT independently generated.
+
+Add rows to `DimDeptAccountBridge` for every delivery department:
+
+```python
+# Bridge rows for COGS delivery accounts — add alongside payroll bridge rows
+COGS_BRIDGE_ROWS = [
+    # DeptKey  DeptName              AccountKey  AccountCode  SplitPct
+    (6,        "Professional Svcs",  21,         "SDC-PS",    1.00),
+    (3,        "Customer Success",   22,         "SDC-CS",    1.00),
+    # Add more delivery departments as needed per use case
+]
+```
+
+Separate the bridge into `payroll_bridge` and `cogs_bridge` by filtering on
+`AccountKey` membership in the payroll vs COGS account key sets:
+
+```python
+payroll_account_keys = set(
+    dim_account.loc[dim_account["AccountType"] == "Payroll", "AccountKey"]
+)
+cogs_account_keys = set(
+    dim_account.loc[dim_account["AccountType"] == "COGS", "AccountKey"]
+)
+
+payroll_bridge = dim_bridge[dim_bridge["AccountKey"].isin(payroll_account_keys)]
+cogs_bridge    = dim_bridge[dim_bridge["AccountKey"].isin(cogs_account_keys)]
+```
+
+### Rule 10 — Bridge-Covered Accounts Must Never Appear in INDEPENDENT_BASE
+
+`INDEPENDENT_BASE` contains only accounts that have **no upstream fact source**.
+Payroll, bridge-covered COGS, and any account that derives from `FactARR` or
+`FactSalesActivity` must be excluded.
+
+```python
+# ✅ CORRECT — INDEPENDENT_BASE contains only truly independent accounts
+INDEPENDENT_BASE = {
+    # Subscriptions and infrastructure (no upstream fact table)
+    "SUBC-LIC":   85_000,
+    "SUBC-OPS":   40_000,
+    # Commercial and marketing spend
+    "COPEX-FLD":  55_000,
+    "COPEX-SDR":  30_000,
+    "MKTG":       45_000,
+    # G&A overhead
+    "GAOH":       25_000,
+    # R&D non-payroll
+    "RDOPEX":     20_000,
+    "RDTOOLS":    15_000,
+    # Financial items
+    "FININC":      8_000,
+    "FINEXP":     12_000,
+    # Tax
+    "TAX-US":     18_000,
+    "TAX-EU":     10_000,
+}
+# ❌ MUST NOT appear in INDEPENDENT_BASE:
+# Any payroll account code (COMP-*, GAPAY-*, RDPAY-*, MGMT-PAY)
+# Any bridge-covered COGS code (SDC-PS, SDC-CS, and equivalents)
+# Any revenue account code (RR-*, NL-*, EX-*, NRR-*)
+```
+
+Additionally, the independent fallthrough branch in `build_fact_financial` must
+include an explicit skip guard for bridge-covered accounts:
+
+```python
+# In the independent generation loop — always include this guard:
+else:
+    bridge_covered_keys = {
+        int(r["AccountKey"])
+        for _, r in pd.concat([payroll_bridge, cogs_bridge]).iterrows()
+    }
+    if acc_key in bridge_covered_keys:
+        continue  # bridge-covered account — no headcount in this geo, produce no row
+    base = INDEPENDENT_BASE.get(acc_code)
+    if base is None:
+        continue  # not in independent base — should not reach here; skip silently
+    # ... generate independent row
+```
+
+A bridge-covered account with zero headcount in a GeoKey produces **no row** —
+never a default amount.
+
+### Rule 11 — All 10 Validation Checks Must Pass
+
+For any Fabric Plan integrated planning dataset, 10 checks must all pass before
+the output is considered complete. Any `WARNING` output stops the dataset from
+being delivered.
+
+| # | Check | Assertion |
+|---|---|---|
+| 1 | Star schema — all fact tables | No `object` dtype columns in any fact table |
+| 2 | Star schema — FactHeadcount | No `object` dtype in FactHeadcount specifically |
+| 3 | Star schema — FactARR | No `object` dtype in FactARR specifically |
+| 4 | Variance mix | Adverse variance rows >= 20% of total |
+| 5 | Headcount reconciliation | FactHeadcount Actuals distinct EmployeeKeys == DimEmployee active, diff <= 5 |
+| 6 | ARR waterfall | ClosingARR == OpeningARR + NewARR + ExpansionARR + ContractionARR + ChurnARR, zero mismatches |
+| 7 | Payroll reconciliation | FactFinancial payroll amounts == SUM(FactHeadcount x bridge x SplitPct), max diff $0.00 |
+| 8 | COGS (SDC) reconciliation | FactFinancial SDC amounts == SUM(FactHeadcount x COGS bridge x SplitPct) for bridge GeoKeys only, max diff $0.00 |
+| 9 | Revenue (RR) reconciliation | FactFinancial RR amounts == FactARR.ClosingARR grouped by RevenueAccountCode, max diff $0.00 |
+| 10 | NRR reconciliation | FactFinancial NRR amounts == FactSalesActivity.Revenue grouped by RevenueAccountCode with 40/60 IMPL split, max diff $0.00 |
+
+Checks 7–10 use a shared `check_recon()` helper. The helper recomputes expected
+values **independently from scratch** — not from the lookup dictionaries used during
+generation. This is the only way to catch bugs where derivation logic and validation
+logic drift apart.
+
+```python
+def check_recon(name, account_keys, expected_series, fact_financial,
+                tolerance=0.01, label="Amount"):
+    """
+    Shared reconciliation helper for checks 7–10.
+    account_keys   : set of AccountKey ints to filter FactFinancial
+    expected_series: pd.Series indexed by (DateKey, GeoKey, ScenarioKey) with expected amounts
+    fact_financial : the generated FactFinancial DataFrame
+    """
+    actual_series = (
+        fact_financial[fact_financial["AccountKey"].isin(account_keys)]
+        .groupby(["DateKey", "GeoKey", "ScenarioKey"])["Amount"]
+        .sum()
+    )
+    combined = pd.DataFrame({
+        "Expected": expected_series,
+        "Actual":   actual_series,
+    }).fillna(0)
+    combined["Diff"] = (combined["Actual"] - combined["Expected"]).abs()
+    mismatches = (combined["Diff"] > tolerance).sum()
+    max_diff   = combined["Diff"].max()
+    if mismatches > 0:
+        print(f"⚠️  CHECK {name}: {mismatches} mismatches, max diff ${max_diff:,.2f}")
+    else:
+        print(f"✅ Check {name} passed — {label} reconciles across "
+              f"{len(combined):,} (DateKey, GeoKey, Scenario) groups")
+
+
+def validate_all(fact_financial, fact_headcount, fact_arr, fact_sales,
+                 dim_account, dim_employee, dim_bridge, dim_product, dim_customer,
+                 latest_period_date):
+    """
+    Runs all 10 mandatory validation checks.
+    Must receive all upstream tables — recomputes expected values from scratch.
+    """
+    tables = {
+        "FactFinancial":    fact_financial,
+        "FactHeadcount":    fact_headcount,
+        "FactARR":          fact_arr,
+        "FactSalesActivity": fact_sales,
+    }
+    print("\n  MANDATORY VALIDATION CHECKS (10 required)")
+    print("  " + "─" * 53)
+
+    # Checks 1–3: Star schema
+    check_star_schema_dtypes({"FactFinancial": fact_financial})
+    check_star_schema_dtypes({"FactHeadcount": fact_headcount})
+    check_star_schema_dtypes({"FactARR": fact_arr})
+
+    # Check 4: Variance mix
+    check_variance_mix(fact_financial, dim_account)
+
+    # Check 5: Headcount reconciliation
+    check_headcount_reconciliation(fact_headcount, dim_employee, latest_period_date)
+
+    # Check 6: ARR waterfall
+    check_arr_waterfall(fact_arr)
+
+    # Checks 7–10: Derive expected values independently and reconcile
+
+    # 7 — Payroll
+    payroll_keys = set(dim_account.loc[
+        dim_account["AccountType"] == "Payroll", "AccountKey"])
+    payroll_bridge = dim_bridge[dim_bridge["AccountKey"].isin(payroll_keys)]
+    expected_payroll = (
+        fact_headcount
+        .merge(payroll_bridge[["DepartmentKey", "AccountKey", "SplitPct"]],
+               on="DepartmentKey")
+        .assign(Contribution=lambda d: d["FullyLoadedCost"] * d["SplitPct"])
+        .groupby(["DateKey", "GeoKey", "ScenarioKey"])["Contribution"].sum()
+    )
+    check_recon("7 PAYROLL", payroll_keys, expected_payroll, fact_financial,
+                label="Payroll")
+
+    # 8 — COGS SDC
+    cogs_keys = set(dim_account.loc[
+        dim_account["AccountType"] == "COGS", "AccountKey"])
+    cogs_bridge = dim_bridge[dim_bridge["AccountKey"].isin(cogs_keys)]
+    expected_cogs = (
+        fact_headcount
+        .merge(cogs_bridge[["DepartmentKey", "AccountKey", "SplitPct"]],
+               on="DepartmentKey")
+        .assign(Contribution=lambda d: d["FullyLoadedCost"] * d["SplitPct"])
+        .groupby(["DateKey", "GeoKey", "ScenarioKey"])["Contribution"].sum()
+    )
+    check_recon("8 COGS-SDC", cogs_keys, expected_cogs, fact_financial,
+                label="COGS delivery")
+
+    # 9 — Revenue RR (recompute rev_lookup independently)
+    expected_rr = build_rev_lookup(fact_arr, dim_product, dim_customer)
+    rr_keys = set(dim_account.loc[
+        dim_account["AccountCode"].str.startswith(("RR-", "NL-", "EX-")), "AccountKey"])
+    rr_series = pd.Series(
+        {k: v for k, v in expected_rr.items() if k[3] in rr_keys}
+    ).groupby(level=[0, 1, 2]).sum()
+    check_recon("9 REVENUE-RR", rr_keys, rr_series, fact_financial,
+                label="Recurring revenue")
+
+    # 10 — NRR
+    nrr_keys = set(dim_account.loc[
+        dim_account["AccountCode"].str.startswith("NRR-"), "AccountKey"])
+    nrr_prod = fact_sales.merge(
+        dim_product[["ProductKey", "RevenueAccountCode"]], on="ProductKey", how="left"
+    )
+    # Apply 40/60 IMPL split
+    def apply_impl_split(row):
+        if row["RevenueAccountCode"] == "NRR-IMPL":
+            return row["Revenue"] * 0.40
+        elif row["RevenueAccountCode"] == "NRR-ENT":
+            return row["Revenue"] * 0.60
+        return row["Revenue"]
+    nrr_prod["AdjRevenue"] = nrr_prod.apply(apply_impl_split, axis=1)
+    expected_nrr = nrr_prod.groupby(
+        ["DateKey", "GeoKey", "ScenarioKey"])["AdjRevenue"].sum()
+    check_recon("10 NRR", nrr_keys, expected_nrr, fact_financial,
+                label="Non-recurring revenue")
+
+    print()
+```
 
 ```python
 # ══════════════════════════════════════════════════════════════════
@@ -2004,10 +2675,14 @@ def check_arr_waterfall(fact_arr):
               f"{len(fact_arr):,} rows")
 
 
+```python
 def run_all_checks(tables, dim_account=None, dim_employee=None,
                    fact_headcount=None, fact_financial=None,
                    fact_arr=None, latest_period_date=None):
-    """Run all four mandatory checks. Call before printing final summary."""
+    """
+    Legacy 4-check wrapper — use validate_all() instead for integrated planning datasets.
+    Kept for non-financial use cases that do not have FactARR or FactSalesActivity.
+    """
     print("\n  MANDATORY VALIDATION CHECKS")
     print("  " + "─" * 53)
     check_star_schema_dtypes(tables)
@@ -2018,6 +2693,10 @@ def run_all_checks(tables, dim_account=None, dim_employee=None,
     check_arr_waterfall(fact_arr)
     print()
 ```
+
+**For integrated planning datasets (any dataset with DimAccount + FactFinancial),
+use `validate_all()` defined in the Integrated Ledger Rules section above, which
+runs all 10 checks. `run_all_checks()` is only for non-financial use cases.**
 
 **Headcount generation rule — non-negotiable:**
 FactHeadcount Actuals (ScenarioKey=1) must be derived from DimEmployee by counting
@@ -2326,14 +3005,20 @@ def generate_schema_section(table_name, df, descriptions=None, sample_row=None):
   ✅ FK integrity               : All foreign keys validated
   ✅ Date coverage              : All fact dates within DimDate
 
-  MANDATORY VALIDATION CHECKS
+  MANDATORY VALIDATION CHECKS (10 for integrated planning / 4 for non-financial)
   ─────────────────────────────────────────────────────────
-  Check 1 — Star Schema dtypes    ✅ / ⚠️   No unexpected object dtype cols
-  Check 2 — Variance mix          ✅ / ⚠️   [xx]% favourable / [xx]% adverse
-  Check 3 — Headcount recon       ✅ / ⚠️   diff = 0 ([n] active employees)
-  Check 4 — ARR waterfall         ✅ / ⚠️   [n] rows reconcile / skipped
+  Check 1  — Star schema (all facts)    ✅ / ⚠️
+  Check 2  — Star schema (FactHC)       ✅ / ⚠️
+  Check 3  — Star schema (FactARR)      ✅ / ⚠️   (skipped if no FactARR)
+  Check 4  — Variance mix               ✅ / ⚠️   [xx]% favourable / [xx]% adverse
+  Check 5  — Headcount recon            ✅ / ⚠️   diff = 0 / diff = [n]
+  Check 6  — ARR waterfall              ✅ / ⚠️   [n] rows / skipped
+  Check 7  — Payroll recon              ✅ / ⚠️   max diff $0.00 / skipped
+  Check 8  — COGS SDC recon             ✅ / ⚠️   max diff $0.00 / skipped
+  Check 9  — Revenue RR recon           ✅ / ⚠️   max diff $0.00 / skipped
+  Check 10 — NRR recon                  ✅ / ⚠️   max diff $0.00 / skipped
   ─────────────────────────────────────────────────────────
-  ⚠️ VALIDATION WARNINGS: [n]   (only shown if any check fails)
+  ⚠️ VALIDATION WARNINGS: [n]   (any warning stops delivery)
 
   RECONCILIATION
   ─────────────────────────────────────────────────────────
