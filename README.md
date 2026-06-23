@@ -10,7 +10,7 @@
 **© 2026 Logeshkumar Sivakumar. All rights reserved.**
 
 ---
-
+ 
 ## What This Skill Does
  
 Demo Dataset Creator instructs Claude to produce a single, self-contained Python script
@@ -280,7 +280,7 @@ attribution block automatically.
 | [`enterprise-pbix-model-builder`](https://github.com/Logeshkumar-10/pbix-model-creator) | Builds a fully modelled Power BI semantic model from an enterprise dataset. Produces BIM, DAX measures, and documentation. Can be chained after enterprise-planning-dataset-creator. |
 
 ---
-
+ 
 ## Changelog
  
 | Version | Date | Changes |
@@ -290,7 +290,7 @@ attribution block automatically.
 | 1.2 | June 2026 | Star schema rules; DimEmployee level columns with sort keys; four mandatory validation checks; CSV output rule; documentation schema data-type tables; UTF-8 encoding rule. |
 | 1.1 | June 2026 | Fixed inverted variance direction. Added DimAccount sort key columns. |
 | 1.0 | May 2026 | Initial release. |
-
+ 
 ---
 
 ## License
